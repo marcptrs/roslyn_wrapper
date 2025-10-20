@@ -76,6 +76,10 @@ To create a new release:
 
 Update `WRAPPER_REPO_OWNER` and `WRAPPER_REPO_NAME` in `csharp_roslyn/src/nuget.rs` to point to your GitHub repository.
 
+## License
+
+MIT License - see [LICENSE](LICENSE) for details.
+
 ## Inspiration
 
 This project was inspired by [SofusA/csharp-language-server](https://github.com/SofusA/csharp-language-server), which demonstrated the transparent wrapper approach for Roslyn compatibility with non-VSCode editors.
