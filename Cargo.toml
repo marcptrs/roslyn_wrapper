@@ -3,6 +3,8 @@ name = "roslyn-wrapper"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+description = "LSP proxy for C# Roslyn language server with cross-project support"
+repository = "https://github.com/marcptrs/roslyn-wrapper"
 
 [[bin]]
 name = "roslyn-wrapper"
@@ -12,11 +14,18 @@ path = "src/main.rs"
 tokio = { version = "1.35", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde-xml-rs = "0.6"
 anyhow = "1.0"
 url = "2.5"
 walkdir = "2.4"
 clap = { version = "4.5", features = ["derive"] }
 chrono = "0.4"
+reqwest = { version = "0.11", features = ["stream"] }
+flate2 = "1.0"
+zip = "0.6"
+directories = "5.0"
+dirs = "5.0"
+uuid = { version = "1.6", features = ["v4", "serde"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
