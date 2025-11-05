@@ -145,8 +145,32 @@ fn main() -> io::Result<()> {
 }
 
 async fn run() -> io::Result<()> {
-    // Get Roslyn LSP path from command-line arguments (provided by csharp_roslyn extension)
-    let roslyn_path_str = if let Some(path_arg) = std::env::args().nth(1) {
+    let args: Vec<String> = std::env::args().collect();
+    
+    // Check if we should pass through arguments to Roslyn (e.g., --version, --help)
+    if args.len() > 1 {
+        let first_arg = &args[1];
+        
+        // If first argument looks like a flag (starts with -), pass through to Roslyn
+        if first_arg.starts_with('-') {
+            eprintln!("[roslyn_wrapper] Pass-through mode: forwarding arguments to Roslyn");
+            
+            // Download/find Roslyn first
+            let roslyn_path = download::get_roslyn_path()
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            
+            // Execute Roslyn with the provided arguments
+            let status = Command::new(roslyn_path)
+                .args(&args[1..])
+                .status()?;
+            
+            std::process::exit(status.code().unwrap_or(1));
+        }
+    }
+    
+    // LSP proxy mode: Get Roslyn LSP path from command-line arguments or download
+    let roslyn_path_str = if let Some(path_arg) = args.get(1) {
         eprintln!("[roslyn_wrapper] Using Roslyn LSP path from extension: {}", path_arg);
         eprintln!("[roslyn_wrapper] Path length: {} chars", path_arg.len());
         
@@ -171,7 +195,7 @@ async fn run() -> io::Result<()> {
                 match std::fs::metadata(&path_arg) {
                     Ok(metadata) => {
                         eprintln!("[roslyn_wrapper] Original path format works! Size: {} bytes", metadata.len());
-                        path_arg
+                        path_arg.to_string()
                     }
                     Err(e2) => {
                         eprintln!("[roslyn_wrapper] ERROR: Original path also failed: {}", e2);
@@ -202,8 +226,11 @@ async fn run() -> io::Result<()> {
     let mut initialized = false;
     let mut solution_uri: Option<String> = None;
 
+    eprintln!("[roslyn_wrapper] Entering main LSP message loop...");
+
     loop {
         // Read message from client (Zed)
+        eprintln!("[roslyn_wrapper] Waiting for client message...");
         let mut content_length = 0;
         let mut line = String::new();
 
@@ -239,6 +266,8 @@ async fn run() -> io::Result<()> {
 
         // Parse client message
         if let Ok(client_msg) = serde_json::from_str::<Value>(&body) {
+            eprintln!("[roslyn_wrapper] <== FROM CLIENT: {}", serde_json::to_string(&client_msg).unwrap_or_else(|_| "invalid".to_string()));
+            
             // Check for initialization request to extract solution URI
             if let Some(method) = client_msg.get("method").and_then(|v| v.as_str()) {
                 if method == "initialize" {
@@ -254,44 +283,82 @@ async fn run() -> io::Result<()> {
             }
 
             // Forward client message to Roslyn
+            eprintln!("[roslyn_wrapper] ==> TO ROSLYN: {}", serde_json::to_string(&client_msg).unwrap_or_else(|_| "invalid".to_string()));
             proxy.forward_to_roslyn(&client_msg)?;
 
-            // Read response from Roslyn
-            if let Ok(Some(roslyn_msg)) = proxy.read_message() {
-                // Check if this is initialization response
-                if roslyn_msg.get("method").is_none() && roslyn_msg.get("result").is_some() {
-                    // This is a response (could be to the initialize request)
-                    if let Some(result) = roslyn_msg.get("result") {
-                        if result.get("capabilities").is_some() {
-                            initialized = true;
-                            eprintln!("[roslyn_wrapper] Initialization complete");
+            // Get the request ID if this is a request (not a notification)
+            let request_id = client_msg.get("id").cloned();
 
-                            // Forward response to client first
-                            LspProxy::forward_to_client(&mut stdout, &roslyn_msg)?;
+            // Read all messages from Roslyn until we get the response (if this was a request)
+            // Roslyn may send notifications before the actual response
+            loop {
+                match proxy.read_message() {
+                    Ok(Some(roslyn_msg)) => {
+                        eprintln!("[roslyn_wrapper] <== FROM ROSLYN: {}", serde_json::to_string(&roslyn_msg).unwrap_or_else(|_| "invalid".to_string()));
+                        
+                        // Check if this is a response (has an id field matching our request)
+                        let is_response = if let Some(ref req_id) = request_id {
+                            roslyn_msg.get("id") == Some(req_id)
+                        } else {
+                            false
+                        };
 
-                            // Then send solution/open notification if we have a solution
-                            if let Some(ref sol_uri) = solution_uri {
-                                let notification = json!({
-                                    "jsonrpc": "2.0",
-                                    "method": "solution/open",
-                                    "params": {
-                                        "solution": sol_uri
+                        // Check if this is initialization response
+                        if is_response {
+                            if let Some(result) = roslyn_msg.get("result") {
+                                if result.get("capabilities").is_some() {
+                                    initialized = true;
+                                    eprintln!("[roslyn_wrapper] Initialization complete");
+
+                                    // Forward response to client first
+                                    eprintln!("[roslyn_wrapper] ==> TO CLIENT (init response): {}", serde_json::to_string(&roslyn_msg).unwrap_or_else(|_| "invalid".to_string()));
+                                    LspProxy::forward_to_client(&mut stdout, &roslyn_msg)?;
+
+                                    // Then send solution/open notification if we have a solution
+                                    if let Some(ref sol_uri) = solution_uri {
+                                        let notification = json!({
+                                            "jsonrpc": "2.0",
+                                            "method": "solution/open",
+                                            "params": {
+                                                "solution": sol_uri
+                                            }
+                                        });
+
+                                        eprintln!("[roslyn_wrapper] Sending solution/open notification");
+                                        if let Err(e) = proxy.send_message(&notification) {
+                                            eprintln!("[roslyn_wrapper] Error sending solution/open: {}", e);
+                                        }
                                     }
-                                });
 
-                                eprintln!("[roslyn_wrapper] Sending solution/open notification");
-                                if let Err(e) = proxy.send_message(&notification) {
-                                    eprintln!("[roslyn_wrapper] Error sending solution/open: {}", e);
+                                    break; // Done processing this request
                                 }
                             }
-
-                            continue; // Skip the forward below since we handled it
+                            
+                            // Forward any other response to client
+                            eprintln!("[roslyn_wrapper] ==> TO CLIENT (response): {}", serde_json::to_string(&roslyn_msg).unwrap_or_else(|_| "invalid".to_string()));
+                            LspProxy::forward_to_client(&mut stdout, &roslyn_msg)?;
+                            break; // Done processing this request
+                        } else {
+                            // This is a notification or other message, forward it immediately
+                            eprintln!("[roslyn_wrapper] ==> TO CLIENT (notification): {}", serde_json::to_string(&roslyn_msg).unwrap_or_else(|_| "invalid".to_string()));
+                            LspProxy::forward_to_client(&mut stdout, &roslyn_msg)?;
+                            
+                            // If the original client message was a notification (no id), stop here
+                            if request_id.is_none() {
+                                break;
+                            }
+                            // Otherwise, continue reading to get the response
                         }
                     }
+                    Ok(None) => {
+                        eprintln!("[roslyn_wrapper] Roslyn closed connection");
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        eprintln!("[roslyn_wrapper] Error reading from Roslyn: {}", e);
+                        return Err(e);
+                    }
                 }
-
-                // Forward response to client
-                LspProxy::forward_to_client(&mut stdout, &roslyn_msg)?;
             }
         }
 

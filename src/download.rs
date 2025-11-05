@@ -7,11 +7,11 @@ use flate2::read::GzDecoder;
 use tar::Archive as TarArchive;
 
 // Try these versions in order until one works
+// Using Azure DevOps feed versions (latest from msft_consumption feed)
 const ROSLYN_VERSIONS: &[&str] = &[
+    "5.3.0-2.25554.12",
+    "5.3.0-2.25553.6",
     "5.0.0-1.25277.114",
-    "4.12.0",
-    "4.11.0",
-    "4.10.0",
 ];
 
 /// Get the cache directory for storing Roslyn
@@ -142,15 +142,18 @@ fn find_global_roslyn() -> Result<PathBuf> {
     Err(anyhow!("Global Roslyn installation not found"))
 }
 
-/// Download Roslyn from NuGet and extract it
+/// Download Roslyn from Azure DevOps NuGet feed and extract it
 async fn download_and_extract_roslyn(target_dir: &Path, version: &str) -> Result<()> {
     fs::create_dir_all(target_dir)?;
 
-    let (rid, extension) = get_platform_info();
+    let (rid, _extension) = get_platform_info();
     let package_name = format!("Microsoft.CodeAnalysis.LanguageServer.{}", rid);
+    
+    // Use Azure DevOps NuGet v3 flat container URL (lowercase package name)
+    let package_name_lower = package_name.to_lowercase();
     let nuget_url = format!(
-        "https://www.nuget.org/api/v2/package/{}/{}",
-        package_name, version
+        "https://pkgs.dev.azure.com/azure-public/vside/_packaging/msft_consumption/nuget/v3/flat2/{}/{}/{}.{}.nupkg",
+        package_name_lower, version, package_name_lower, version
     );
 
     eprintln!("[roslyn-wrapper] Downloading from: {}", nuget_url);
@@ -176,17 +179,8 @@ async fn download_and_extract_roslyn(target_dir: &Path, version: &str) -> Result
         .join(format!(".tmp_{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&temp_path)?;
 
-    match extension {
-        "zip" => {
-            extract_zip(&bytes, &temp_path)?;
-        }
-        "tar.gz" => {
-            extract_tar_gz(&bytes, &temp_path)?;
-        }
-        _ => {
-            return Err(anyhow!("Unsupported archive format: {}", extension));
-        }
-    }
+    // NuGet packages are always ZIP files
+    extract_zip(&bytes, &temp_path)?;
 
     // Move from temp to final location
     eprintln!("[roslyn-wrapper] Moving extracted files from temp to: {}", target_dir.display());
@@ -303,6 +297,7 @@ fn extract_tar_gz(bytes: &[u8], temp_path: &Path) -> Result<()> {
 }
 
 /// Get platform-specific runtime identifier and archive extension
+/// Note: NuGet packages (.nupkg) are always ZIP files regardless of platform
 fn get_platform_info() -> (&'static str, &'static str) {
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     return ("win-x64", "zip");
@@ -311,16 +306,16 @@ fn get_platform_info() -> (&'static str, &'static str) {
     return ("win-arm64", "zip");
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    return ("linux-x64", "tar.gz");
+    return ("linux-x64", "zip");
 
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-    return ("linux-arm64", "tar.gz");
+    return ("linux-arm64", "zip");
 
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-    return ("osx-x64", "tar.gz");
+    return ("osx-x64", "zip");
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    return ("osx-arm64", "tar.gz");
+    return ("osx-arm64", "zip");
 
     // Default fallback for unsupported platforms
     #[cfg(not(any(
@@ -331,7 +326,7 @@ fn get_platform_info() -> (&'static str, &'static str) {
         all(target_os = "macos", target_arch = "x86_64"),
         all(target_os = "macos", target_arch = "aarch64"),
     )))]
-    ("neutral", "tar.gz")
+    ("neutral", "zip")
 }
 
 #[cfg(test)]

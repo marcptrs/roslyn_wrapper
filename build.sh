@@ -37,23 +37,33 @@ fi
 echo "✅ Binary built successfully: $BINARY_PATH"
 echo ""
 
-# Copy to cache locations for local testing
-echo "📦 Copying binary to local cache locations for testing..."
+# Copy to Zed extension cache for local testing
+echo "📦 Copying binary to Zed extension cache for testing..."
 
-# Create cache directories
-mkdir -p ~/.local/share/roslyn-wrapper/bin/0.1.0
-mkdir -p ~/.cache/roslyn-wrapper/bin/0.1.0
+# Detect OS and set cache path
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    # macOS
+    ZED_CACHE_DIR="${HOME}/Library/Application Support/Zed/extensions/work/csharp_roslyn"
+elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
+    # Linux
+    ZED_CACHE_DIR="${HOME}/.config/zed/extensions/work/csharp_roslyn"
+else
+    echo "❌ Unsupported platform: $OSTYPE"
+    exit 1
+fi
+
+# Use a fixed cache directory (no versioning in path for simpler updates)
+CACHE_DIR="${ZED_CACHE_DIR}/roslyn-wrapper"
+mkdir -p "$CACHE_DIR"
 
 # Copy binary
-cp "$BINARY_PATH" ~/.local/share/roslyn-wrapper/bin/0.1.0/
-cp "$BINARY_PATH" ~/.cache/roslyn-wrapper/bin/0.1.0/
+cp "$BINARY_PATH" "$CACHE_DIR/"
 
 # Make executable
-chmod +x ~/.local/share/roslyn-wrapper/bin/0.1.0/$BINARY_NAME
-chmod +x ~/.cache/roslyn-wrapper/bin/0.1.0/$BINARY_NAME
+chmod +x "$CACHE_DIR/$BINARY_NAME"
 
 echo ""
 echo "✅ Build complete!"
 echo "📍 Binary location: $BINARY_PATH"
-echo "📁 Cached at: ~/.local/share/roslyn-wrapper/bin/0.1.0/$BINARY_NAME"
-echo "📁 Cached at: ~/.cache/roslyn-wrapper/bin/0.1.0/$BINARY_NAME"
+echo "📁 Zed cache location: $CACHE_DIR/$BINARY_NAME"
+echo "🎯 The extension will automatically use this cached binary when running in Zed"
