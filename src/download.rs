@@ -3,6 +3,8 @@ use directories::ProjectDirs;
 use std::fs;
 use std::path::{Path, PathBuf};
 use zip::ZipArchive;
+use flate2::read::GzDecoder;
+use tar::Archive as TarArchive;
 
 // Try these versions in order until one works
 const ROSLYN_VERSIONS: &[&str] = &[
@@ -144,7 +146,7 @@ fn find_global_roslyn() -> Result<PathBuf> {
 async fn download_and_extract_roslyn(target_dir: &Path, version: &str) -> Result<()> {
     fs::create_dir_all(target_dir)?;
 
-    let (rid, _extension) = get_platform_info();
+    let (rid, extension) = get_platform_info();
     let package_name = format!("Microsoft.CodeAnalysis.LanguageServer.{}", rid);
     let nuget_url = format!(
         "https://www.nuget.org/api/v2/package/{}/{}",
@@ -174,7 +176,47 @@ async fn download_and_extract_roslyn(target_dir: &Path, version: &str) -> Result
         .join(format!(".tmp_{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&temp_path)?;
 
-    // NuGet packages are ZIP files
+    match extension {
+        "zip" => {
+            extract_zip(&bytes, &temp_path)?;
+        }
+        "tar.gz" => {
+            extract_tar_gz(&bytes, &temp_path)?;
+        }
+        _ => {
+            return Err(anyhow!("Unsupported archive format: {}", extension));
+        }
+    }
+
+    // Move from temp to final location
+    eprintln!("[roslyn-wrapper] Moving extracted files from temp to: {}", target_dir.display());
+    let mut copied_count = 0;
+    for entry in walkdir::WalkDir::new(&temp_path) {
+        let entry = entry?;
+        let rel_path = entry
+            .path()
+            .strip_prefix(&temp_path)
+            .unwrap_or(entry.path());
+        let target_path = target_dir.join(rel_path);
+
+        if entry.path().is_dir() {
+            fs::create_dir_all(&target_path)?;
+        } else {
+            fs::create_dir_all(target_path.parent().unwrap())?;
+            fs::copy(entry.path(), &target_path)?;
+            copied_count += 1;
+        }
+    }
+    eprintln!("[roslyn-wrapper] Copied {} files to {}", copied_count, target_dir.display());
+
+    fs::remove_dir_all(temp_path)?;
+    eprintln!("[roslyn-wrapper] Extraction complete");
+
+    Ok(())
+}
+
+/// Extract a ZIP archive and copy LanguageServer files to temp directory
+fn extract_zip(bytes: &[u8], temp_path: &Path) -> Result<()> {
     let mut zip = ZipArchive::new(std::io::Cursor::new(bytes))?;
 
     // Find and extract LanguageServer files
@@ -211,29 +253,51 @@ async fn download_and_extract_roslyn(target_dir: &Path, version: &str) -> Result
         }
     }
 
-    // Move from temp to final location
-    eprintln!("[roslyn-wrapper] Moving extracted files from temp to: {}", target_dir.display());
-    let mut copied_count = 0;
-    for entry in walkdir::WalkDir::new(&temp_path) {
-        let entry = entry?;
-        let rel_path = entry
-            .path()
-            .strip_prefix(&temp_path)
-            .unwrap_or(entry.path());
-        let target_path = target_dir.join(rel_path);
+    Ok(())
+}
 
-        if entry.path().is_dir() {
-            fs::create_dir_all(&target_path)?;
-        } else {
-            fs::create_dir_all(target_path.parent().unwrap())?;
-            fs::copy(entry.path(), &target_path)?;
-            copied_count += 1;
+/// Extract a tar.gz archive and copy LanguageServer files to temp directory
+fn extract_tar_gz(bytes: &[u8], temp_path: &Path) -> Result<()> {
+    let gz_decoder = GzDecoder::new(std::io::Cursor::new(bytes));
+    let mut tar_archive = TarArchive::new(gz_decoder);
+
+    // Extract all entries
+    for entry_result in tar_archive.entries()? {
+        let mut entry = entry_result?;
+        let path = entry.path()?.to_path_buf();
+        let path_str = path.to_str().unwrap_or("");
+
+        // Look for files in the content/LanguageServer directory
+        if path_str.contains("content/LanguageServer") {
+            let relative_path = path_str
+                .split("content/LanguageServer/")
+                .last()
+                .unwrap_or("");
+
+            if !relative_path.is_empty() {
+                let target_file_path = temp_path.join(relative_path);
+                
+                if entry.header().entry_type().is_dir() {
+                    fs::create_dir_all(&target_file_path)?;
+                } else {
+                    fs::create_dir_all(target_file_path.parent().unwrap())?;
+                    entry.unpack(&target_file_path)?;
+
+                    // Make executable on Unix
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        if relative_path.ends_with("Microsoft.CodeAnalysis.LanguageServer") {
+                            let perms = fs::Permissions::from_mode(0o755);
+                            fs::set_permissions(&target_file_path, perms)?;
+                        }
+                    }
+
+                    eprintln!("[roslyn-wrapper] Extracted: {}", relative_path);
+                }
+            }
         }
     }
-    eprintln!("[roslyn-wrapper] Copied {} files to {}", copied_count, target_dir.display());
-
-    fs::remove_dir_all(temp_path)?;
-    eprintln!("[roslyn-wrapper] Extraction complete");
 
     Ok(())
 }
