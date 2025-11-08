@@ -3,8 +3,6 @@ use directories::ProjectDirs;
 use std::fs;
 use std::path::{Path, PathBuf};
 use zip::ZipArchive;
-use flate2::read::GzDecoder;
-use tar::Archive as TarArchive;
 
 // Try these versions in order until one works
 // Using Azure DevOps feed versions (latest from msft_consumption feed)
@@ -35,11 +33,7 @@ pub async fn get_roslyn_path() -> Result<PathBuf> {
         
         // Search for the binary in this version directory
         if let Ok(binary_path) = find_binary_in_dir(&version_dir) {
-            eprintln!(
-                "[roslyn-wrapper] Found cached Roslyn {} at: {}",
-                version,
-                binary_path.display()
-            );
+            crate::logger::info(format!("[roslyn_wrapper] Using cached Roslyn {}", version));
             return Ok(binary_path);
         }
     }
@@ -48,40 +42,27 @@ pub async fn get_roslyn_path() -> Result<PathBuf> {
     for version in ROSLYN_VERSIONS {
         let version_dir = cache_dir.join(version);
 
-        eprintln!(
-            "[roslyn-wrapper] Trying to download Roslyn {} from NuGet...",
-            version
-        );
+        crate::logger::info(format!("[roslyn_wrapper] Downloading Roslyn {}", version));
 
         if let Ok(()) = download_and_extract_roslyn(&version_dir, version).await {
-            eprintln!("[roslyn-wrapper] download_and_extract_roslyn succeeded, searching for binary");
+            crate::logger::debug("[roslyn_wrapper] Download and extraction succeeded");
             // Search for the binary after extraction
             if let Ok(binary_path) = find_binary_in_dir(&version_dir) {
-                eprintln!(
-                    "[roslyn-wrapper] Successfully installed Roslyn {} at: {}",
-                    version,
-                    binary_path.display()
-                );
+                crate::logger::info(format!("[roslyn_wrapper] Installed Roslyn {}", version));
                 return Ok(binary_path);
             } else {
-                eprintln!("[roslyn-wrapper] Binary not found in directory after extraction!");
+                crate::logger::error("[roslyn_wrapper] Binary not found after extraction");
             }
         } else {
-            eprintln!("[roslyn-wrapper] download_and_extract_roslyn failed");
+            crate::logger::error("[roslyn_wrapper] Download or extraction failed");
         }
-        eprintln!(
-            "[roslyn-wrapper] Failed to download version {}, trying next...",
-            version
-        );
+        crate::logger::info(format!("[roslyn_wrapper] Trying next version after {}", version));
     }
 
     // Fallback: Try to use globally installed Roslyn via dotnet tool
-    eprintln!("[roslyn-wrapper] Trying to find globally installed Roslyn...");
+    crate::logger::info("[roslyn_wrapper] Checking for globally installed Roslyn");
     if let Ok(global_path) = find_global_roslyn() {
-        eprintln!(
-            "[roslyn-wrapper] Found globally installed Roslyn at: {}",
-            global_path.display()
-        );
+        crate::logger::info("[roslyn_wrapper] Using globally installed Roslyn");
         return Ok(global_path);
     }
 
@@ -106,7 +87,7 @@ fn find_binary_in_dir(dir: &Path) -> Result<PathBuf> {
         if let Ok(entry) = entry {
             if entry.file_name() == binary_name {
                 let path = entry.path().to_path_buf();
-                eprintln!("[roslyn-wrapper] Found binary at: {}", path.display());
+                crate::logger::debug("[roslyn_wrapper] Found binary");
                 return Ok(path);
             }
         }
@@ -146,9 +127,9 @@ fn find_global_roslyn() -> Result<PathBuf> {
 async fn download_and_extract_roslyn(target_dir: &Path, version: &str) -> Result<()> {
     fs::create_dir_all(target_dir)?;
 
-    let (rid, _extension) = get_platform_info();
+    let rid = get_platform_rid();
     let package_name = format!("Microsoft.CodeAnalysis.LanguageServer.{}", rid);
-    
+
     // Use Azure DevOps NuGet v3 flat container URL (lowercase package name)
     let package_name_lower = package_name.to_lowercase();
     let nuget_url = format!(
@@ -156,7 +137,7 @@ async fn download_and_extract_roslyn(target_dir: &Path, version: &str) -> Result
         package_name_lower, version, package_name_lower, version
     );
 
-    eprintln!("[roslyn-wrapper] Downloading from: {}", nuget_url);
+    crate::logger::debug(format!("[roslyn_wrapper] Download URL: {}", nuget_url));
 
     let client = reqwest::Client::new();
     let response = client.get(&nuget_url).send().await?;
@@ -170,7 +151,7 @@ async fn download_and_extract_roslyn(target_dir: &Path, version: &str) -> Result
     }
 
     let bytes = response.bytes().await?;
-    eprintln!("[roslyn-wrapper] Downloaded {} bytes", bytes.len());
+    crate::logger::debug(format!("[roslyn_wrapper] Download size {} bytes", bytes.len()));
 
     // Extract to temporary location first
     let temp_path = target_dir
@@ -183,7 +164,7 @@ async fn download_and_extract_roslyn(target_dir: &Path, version: &str) -> Result
     extract_zip(&bytes, &temp_path)?;
 
     // Move from temp to final location
-    eprintln!("[roslyn-wrapper] Moving extracted files from temp to: {}", target_dir.display());
+    crate::logger::debug("[roslyn_wrapper] Moving extracted files");
     let mut copied_count = 0;
     for entry in walkdir::WalkDir::new(&temp_path) {
         let entry = entry?;
@@ -201,10 +182,10 @@ async fn download_and_extract_roslyn(target_dir: &Path, version: &str) -> Result
             copied_count += 1;
         }
     }
-    eprintln!("[roslyn-wrapper] Copied {} files to {}", copied_count, target_dir.display());
+    crate::logger::debug(format!("[roslyn_wrapper] Copied {} files", copied_count));
 
     fs::remove_dir_all(temp_path)?;
-    eprintln!("[roslyn-wrapper] Extraction complete");
+    crate::logger::debug("[roslyn_wrapper] Extraction complete");
 
     Ok(())
 }
@@ -242,7 +223,7 @@ fn extract_zip(bytes: &[u8], temp_path: &Path) -> Result<()> {
                     }
                 }
 
-                eprintln!("[roslyn-wrapper] Extracted: {}", relative_path);
+                crate::logger::debug(format!("[roslyn_wrapper] Extracted: {}", relative_path));
             }
         }
     }
@@ -250,74 +231,22 @@ fn extract_zip(bytes: &[u8], temp_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Extract a tar.gz archive and copy LanguageServer files to temp directory
-fn extract_tar_gz(bytes: &[u8], temp_path: &Path) -> Result<()> {
-    let gz_decoder = GzDecoder::new(std::io::Cursor::new(bytes));
-    let mut tar_archive = TarArchive::new(gz_decoder);
 
-    // Extract all entries
-    for entry_result in tar_archive.entries()? {
-        let mut entry = entry_result?;
-        let path = entry.path()?.to_path_buf();
-        let path_str = path.to_str().unwrap_or("");
-
-        // Look for files in the content/LanguageServer directory
-        if path_str.contains("content/LanguageServer") {
-            let relative_path = path_str
-                .split("content/LanguageServer/")
-                .last()
-                .unwrap_or("");
-
-            if !relative_path.is_empty() {
-                let target_file_path = temp_path.join(relative_path);
-                
-                if entry.header().entry_type().is_dir() {
-                    fs::create_dir_all(&target_file_path)?;
-                } else {
-                    fs::create_dir_all(target_file_path.parent().unwrap())?;
-                    entry.unpack(&target_file_path)?;
-
-                    // Make executable on Unix
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        if relative_path.ends_with("Microsoft.CodeAnalysis.LanguageServer") {
-                            let perms = fs::Permissions::from_mode(0o755);
-                            fs::set_permissions(&target_file_path, perms)?;
-                        }
-                    }
-
-                    eprintln!("[roslyn-wrapper] Extracted: {}", relative_path);
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Get platform-specific runtime identifier and archive extension
-/// Note: NuGet packages (.nupkg) are always ZIP files regardless of platform
-fn get_platform_info() -> (&'static str, &'static str) {
+/// Get platform-specific runtime identifier (RID)
+/// NuGet packages (.nupkg) are always ZIP files, so we only need the RID.
+fn get_platform_rid() -> &'static str {
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    return ("win-x64", "zip");
-
+    return "win-x64";
     #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
-    return ("win-arm64", "zip");
-
+    return "win-arm64";
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    return ("linux-x64", "zip");
-
+    return "linux-x64";
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-    return ("linux-arm64", "zip");
-
+    return "linux-arm64";
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-    return ("osx-x64", "zip");
-
+    return "osx-x64";
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    return ("osx-arm64", "zip");
-
-    // Default fallback for unsupported platforms
+    return "osx-arm64";
     #[cfg(not(any(
         all(target_os = "windows", target_arch = "x86_64"),
         all(target_os = "windows", target_arch = "aarch64"),
@@ -326,7 +255,7 @@ fn get_platform_info() -> (&'static str, &'static str) {
         all(target_os = "macos", target_arch = "x86_64"),
         all(target_os = "macos", target_arch = "aarch64"),
     )))]
-    ("neutral", "zip")
+    "neutral"
 }
 
 #[cfg(test)]
@@ -335,7 +264,7 @@ mod tests {
 
     #[test]
     fn test_platform_info() {
-        let (rid, _ext) = get_platform_info();
+        let rid = get_platform_rid();
         assert!(!rid.is_empty());
         println!("Platform RID: {}", rid);
     }

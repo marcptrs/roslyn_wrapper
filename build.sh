@@ -62,6 +62,12 @@ cp "$BINARY_PATH" "$CACHE_DIR/"
 # Make executable
 chmod +x "$CACHE_DIR/$BINARY_NAME"
 
+# Ad-hoc sign on macOS to prevent Gatekeeper from killing it
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    echo "🔐 Ad-hoc signing binary for macOS..."
+    codesign -s - "$CACHE_DIR/$BINARY_NAME" 2>/dev/null || echo "⚠️  Warning: Could not sign binary (may require running as user)"
+fi
+
 echo ""
 echo "✅ Build complete!"
 echo "📍 Binary location: $BINARY_PATH"
