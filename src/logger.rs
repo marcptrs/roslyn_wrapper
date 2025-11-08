@@ -128,11 +128,7 @@ fn initialize_file(path: &PathBuf) -> Option<File> {
         }
     }
 
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .ok()
+    OpenOptions::new().create(true).append(true).open(path).ok()
 }
 
 #[cfg(test)]

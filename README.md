@@ -161,7 +161,7 @@ grep "Error" ~/.local/share/roslyn-wrapper/roslyn-wrapper.log
 
 ### Transparent Proxy Design
 
-roslyn-wrapper follows a **transparent proxy** philosophy:
+roslyn-wrapper follows a **transparent proxy** design principle:
 
 ```
 Editor (Zed) ←→ roslyn-wrapper ←→ Roslyn Language Server

@@ -110,7 +110,9 @@ async fn handle_passthrough_mode(args: &[String]) -> io::Result<()> {
 /// Resolve the Roslyn LSP binary path from arguments or download
 async fn get_roslyn_lsp_path(args: &[String]) -> io::Result<String> {
     if let Some(path_arg) = args.get(1) {
-        logger::info(format!("[roslyn_wrapper] Using Roslyn LSP path from extension: {path_arg}"));
+        logger::info(format!(
+            "[roslyn_wrapper] Using Roslyn LSP path from extension: {path_arg}"
+        ));
 
         // Normalize path
         #[cfg(windows)]
@@ -254,14 +256,14 @@ async fn run() -> io::Result<()> {
                     logger::debug("[roslyn_wrapper] <== FROM CLIENT");
 
                     // Record request method by id for response normalization
-                    if let (Some(id_val), Some(method)) =
-                        (msg.get("id"), msg.get("method").and_then(|v| v.as_str()))
-                    {
-                        // Only track a few methods we may normalize
-                        let should_track = matches!(method, "textDocument/diagnostic");
-                        if should_track {
-                            let mut map = id_method_map_c2r.blocking_lock();
-                            map.insert(id_val.to_string(), method.to_string());
+                    if let Some(id_val) = msg.get("id") {
+                        if let Some(method) = msg.get("method").and_then(|v| v.as_str()) {
+                            // Only track a few methods we may normalize
+                            let should_track = matches!(method, "textDocument/diagnostic");
+                            if should_track {
+                                let mut map = id_method_map_c2r.blocking_lock();
+                                map.insert(id_val.to_string(), method.to_string());
+                            }
                         }
                     }
 
@@ -525,9 +527,7 @@ async fn run() -> io::Result<()> {
                     // Forward to client
                     let mut stdout = stdout_r2c.blocking_lock();
                     if let Err(e) = send_lsp_message(&mut *stdout, &forward_msg) {
-                        logger::error(format!(
-                            "[roslyn_wrapper] Error forwarding to client: {e}"
-                        ));
+                        logger::error(format!("[roslyn_wrapper] Error forwarding to client: {e}"));
                         break;
                     }
                     logger::debug("[roslyn_wrapper] ==> TO CLIENT");
