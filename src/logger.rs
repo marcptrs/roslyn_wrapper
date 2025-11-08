@@ -48,7 +48,9 @@ pub fn log_line(message: impl AsRef<str>) {
     }
 }
 
-pub fn info(message: impl AsRef<str>) { log_line(message); }
+pub fn info(message: impl AsRef<str>) {
+    log_line(message);
+}
 
 pub fn debug(message: impl AsRef<str>) {
     if should_log(LogLevel::Debug) {
@@ -72,7 +74,7 @@ struct LogSink {
 
 impl LogSink {
     fn new() -> Self {
-         let path = log_file_path();
+        let path = log_file_path();
         let mut file = initialize_file(&path);
 
         if let Some(file_handle) = file.as_mut() {
@@ -93,7 +95,7 @@ impl LogSink {
         if let Some(file) = self.file.as_mut() {
             let timestamp = Local::now().to_rfc3339_opts(SecondsFormat::Millis, true);
             for line in message.lines() {
-                let _ = writeln!(file, "[{}] {}", timestamp, line);
+                let _ = writeln!(file, "[{timestamp}] {line}");
             }
             let _ = file.flush();
         }
@@ -126,10 +128,11 @@ fn initialize_file(path: &PathBuf) -> Option<File> {
         }
     }
 
-    match OpenOptions::new().create(true).append(true).open(path) {
-        Ok(file) => Some(file),
-        Err(_) => None,
-    }
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
 }
 
 #[cfg(test)]

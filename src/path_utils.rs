@@ -11,7 +11,7 @@ pub fn url_to_path(uri: &str) -> Result<PathBuf, ()> {
         }
         #[cfg(not(windows))]
         {
-            return Ok(PathBuf::from(format!("/{}", decoded)));
+            return Ok(PathBuf::from(format!("/{decoded}")));
         }
     }
     Err(())
@@ -21,12 +21,12 @@ pub fn path_to_file_uri(p: &Path) -> String {
     #[cfg(windows)]
     {
         let s = p.to_string_lossy().replace('\\', "/");
-        format!("file:///{}", s)
+        format!("file:///{s}")
     }
     #[cfg(not(windows))]
     {
         let s = p.to_string_lossy();
-        format!("file://{}", s)
+        format!("file://{s}")
     }
 }
 
@@ -51,15 +51,29 @@ fn percent_decode(s: &str) -> String {
 
 pub fn try_find_solution_or_project(root: &Path) -> Option<String> {
     // Recursive scan for *.sln first, then *.csproj. Limit depth to avoid huge walks.
-    fn scan_dir(dir: &Path, depth: usize, max_depth: usize, slns: &mut Vec<PathBuf>, projs: &mut Vec<PathBuf>) {
-        if depth > max_depth { return; }
-        let entries = match std::fs::read_dir(dir) { Ok(it) => it, Err(_) => return };
+    fn scan_dir(
+        dir: &Path,
+        depth: usize,
+        max_depth: usize,
+        slns: &mut Vec<PathBuf>,
+        projs: &mut Vec<PathBuf>,
+    ) {
+        if depth > max_depth {
+            return;
+        }
+        let entries = match std::fs::read_dir(dir) {
+            Ok(it) => it,
+            Err(_) => return,
+        };
         for e in entries.flatten() {
             let p = e.path();
             if p.is_file() {
                 if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-                    if ext.eq_ignore_ascii_case("sln") { slns.push(p.clone()); }
-                    else if ext.eq_ignore_ascii_case("csproj") { projs.push(p.clone()); }
+                    if ext.eq_ignore_ascii_case("sln") {
+                        slns.push(p.clone());
+                    } else if ext.eq_ignore_ascii_case("csproj") {
+                        projs.push(p.clone());
+                    }
                 }
             } else if p.is_dir() {
                 scan_dir(&p, depth + 1, max_depth, slns, projs);
