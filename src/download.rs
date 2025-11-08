@@ -18,6 +18,22 @@ pub fn get_cache_dir() -> Result<PathBuf> {
         .cache_dir()
         .to_path_buf();
 
+    // Validate Windows path length limit (260 characters)
+    #[cfg(windows)]
+    {
+        if let Some(path_str) = cache_dir.to_str() {
+            // Windows MAX_PATH is 260 characters, but we need buffer for version subdirs
+            // Typical structure: C:\Users\username\AppData\Local\roslyn-wrapper\cache\{version}\...
+            if path_str.len() > 200 {
+                return Err(anyhow!(
+                    "Cache directory path exceeds safe Windows length limit ({}): {}",
+                    path_str.len(),
+                    path_str
+                ));
+            }
+        }
+    }
+
     fs::create_dir_all(&cache_dir)?;
     Ok(cache_dir)
 }
@@ -160,16 +176,20 @@ fn find_global_roslyn() -> Result<PathBuf> {
     // Common paths where dotnet tools are installed
     let home_dir = dirs::home_dir().ok_or_else(|| anyhow!("Cannot determine home directory"))?;
 
-    let possible_paths = if cfg!(windows) {
-        vec![
-            home_dir.join(".dotnet/tools/Microsoft.CodeAnalysis.LanguageServer.exe"),
-            PathBuf::from("C:/Users")
-                .join(std::env::var("USERNAME").unwrap_or_default())
-                .join(".dotnet/tools/Microsoft.CodeAnalysis.LanguageServer.exe"),
-        ]
-    } else {
-        vec![home_dir.join(".dotnet/tools/Microsoft.CodeAnalysis.LanguageServer")]
-    };
+    let possible_paths = vec![
+        home_dir.join(".dotnet/tools/Microsoft.CodeAnalysis.LanguageServer"),
+    ];
+
+    // On Windows, also try using USERPROFILE environment variable as fallback
+    #[cfg(windows)]
+    {
+        if let Ok(userprofile) = std::env::var("USERPROFILE") {
+            possible_paths.push(
+                PathBuf::from(userprofile)
+                    .join(".dotnet/tools/Microsoft.CodeAnalysis.LanguageServer.exe"),
+            );
+        }
+    }
 
     for path in possible_paths {
         if path.exists() {

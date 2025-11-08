@@ -1,5 +1,14 @@
 use std::path::{Path, PathBuf};
 
+/// Convert a file:// URI to a system path
+/// 
+/// # Windows Paths
+/// - Standard paths: `file:///C:/Users/name` → `C:\Users\name`
+/// - UNC paths (network shares) are NOT currently supported: `file:////server/share`
+///   UNC paths would require special handling to preserve the `\\server\share` format
+/// 
+/// # Unix Paths  
+/// - Standard paths: `file:///home/user` → `/home/user`
 pub fn url_to_path(uri: &str) -> Result<PathBuf, ()> {
     if let Some(rest) = uri.strip_prefix("file://") {
         let trimmed = rest.trim_start_matches('/');
@@ -17,6 +26,15 @@ pub fn url_to_path(uri: &str) -> Result<PathBuf, ()> {
     Err(())
 }
 
+/// Convert a system path to a file:// URI
+/// 
+/// # Windows Paths
+/// - Standard paths: `C:\Users\name` → `file:///C:/Users/name`
+/// - UNC paths (network shares) are NOT currently supported
+///   Consider using `file:////server/share` format if needed in future
+/// 
+/// # Unix Paths
+/// - Standard paths: `/home/user` → `file:///home/user`
 pub fn path_to_file_uri(p: &Path) -> String {
     #[cfg(windows)]
     {
