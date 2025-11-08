@@ -156,7 +156,7 @@ async fn download_and_extract_roslyn(target_dir: &Path, version: &str) -> Result
     // Extract to temporary location first
     let temp_path = target_dir
         .parent()
-        .unwrap()
+        .ok_or_else(|| anyhow!("Failed to get parent directory of target path"))?
         .join(format!(".tmp_{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&temp_path)?;
 
@@ -177,7 +177,9 @@ async fn download_and_extract_roslyn(target_dir: &Path, version: &str) -> Result
         if entry.path().is_dir() {
             fs::create_dir_all(&target_path)?;
         } else {
-            fs::create_dir_all(target_path.parent().unwrap())?;
+            if let Some(parent) = target_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
             fs::copy(entry.path(), &target_path)?;
             copied_count += 1;
         }
@@ -208,7 +210,9 @@ fn extract_zip(bytes: &[u8], temp_path: &Path) -> Result<()> {
 
             if !relative_path.is_empty() && !file.is_dir() {
                 let target_file_path = temp_path.join(relative_path);
-                fs::create_dir_all(target_file_path.parent().unwrap())?;
+                if let Some(parent) = target_file_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
 
                 let mut target_file = fs::File::create(&target_file_path)?;
                 std::io::copy(&mut file, &mut target_file)?;

@@ -72,7 +72,7 @@ struct LogSink {
 
 impl LogSink {
     fn new() -> Self {
-        let path = resolve_log_path();
+         let path = log_file_path();
         let mut file = initialize_file(&path);
 
         if let Some(file_handle) = file.as_mut() {
@@ -100,7 +100,7 @@ impl LogSink {
     }
 }
 
-fn resolve_log_path() -> PathBuf {
+pub fn log_file_path() -> PathBuf {
     if let Ok(path) = std::env::var("ROSLYN_WRAPPER_LOG_PATH") {
         if !path.trim().is_empty() {
             return PathBuf::from(path);
@@ -152,7 +152,7 @@ mod tests {
         env::set_var("ROSLYN_WRAPPER_LOG_PATH", &explicit_path);
         env::remove_var("ROSLYN_WRAPPER_CWD");
 
-        let resolved = resolve_log_path();
+        let resolved = log_file_path();
         assert_eq!(resolved, explicit_path);
 
         env::remove_var("ROSLYN_WRAPPER_LOG_PATH");
@@ -165,7 +165,7 @@ mod tests {
         env::remove_var("ROSLYN_WRAPPER_LOG_PATH");
         env::set_var("ROSLYN_WRAPPER_CWD", temp_dir.path());
 
-        let resolved = resolve_log_path();
+        let resolved = log_file_path();
         assert_eq!(resolved, temp_dir.path().join("roslyn_wrapper.log"));
 
         env::remove_var("ROSLYN_WRAPPER_CWD");
