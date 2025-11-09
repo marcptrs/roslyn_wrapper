@@ -23,3 +23,6 @@ target
 # Project-specific
 logs/
 *.log
+
+# Platform-specific build artifacts
+roslyn-wrapper-*
