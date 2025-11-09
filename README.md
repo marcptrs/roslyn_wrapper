@@ -87,25 +87,51 @@ Behavior:
 
 ## Logs
 
-The wrapper writes a timestamped log file.
+The wrapper writes timestamped log lines to a file.
 
-- Defaults
-  - Path: `./roslyn_wrapper.log` (current working directory of the process)
-  - Level: `info`
+Defaults:
+- File: `./roslyn_wrapper.log` (current working directory when the process starts)
+- Level: `info`
 
-- Environment variables
-  - `ROSLYN_WRAPPER_LOG_LEVEL`: `off` | `error` | `info` | `debug`
-  - `ROSLYN_WRAPPER_LOG_PATH`: absolute/relative file path to write logs
-  - `ROSLYN_WRAPPER_CWD`: directory to place `roslyn_wrapper.log` when `ROSLYN_WRAPPER_LOG_PATH` is not set
+Configuration is done via LSP `initialization_options` (not environment variables). These keys are read from the `initialize` request:
+- `logLevel`: `off` | `error` | `info` | `debug` (case-insensitive)
+- `logFile`: absolute or relative path to the desired log file (overrides `logDirectory`)
+- `logDirectory`: directory where `roslyn_wrapper.log` will be created (ignored if `logFile` is provided)
 
-Examples:
-```bash
-# Follow the log in real-time
-tail -f ./roslyn_wrapper.log
+Precedence: `logFile` > `logDirectory` > default path.
 
-# Increase verbosity for a session
-ROSLYN_WRAPPER_LOG_LEVEL=debug roslyn-wrapper
+Setting `logLevel: "off"` disables all logging output after the initial setup line.
+
+Example Zed configuration with custom logging:
+```json
+{
+  "lsp": {
+    "roslyn": {
+      "binary": { "path": "/absolute/path/to/roslyn-wrapper" },
+      "initialization_options": {
+        "solution": "file:///absolute/path/to/YourSolution.sln",
+        "logLevel": "debug",
+        "logDirectory": "/tmp/roslyn-logs"
+      }
+    }
+  }
+}
 ```
+
+Example using an explicit file instead of a directory:
+```json
+"initialization_options": {
+  "logFile": "/var/log/roslyn-wrapper/roslyn-wrapper.log",
+  "logLevel": "error"
+}
+```
+
+Tail the log in real time:
+```bash
+tail -f ./roslyn_wrapper.log
+```
+
+Breaking change: older versions used `ROSLYN_WRAPPER_LOG_LEVEL`, `ROSLYN_WRAPPER_LOG_PATH`, and `ROSLYN_WRAPPER_CWD`. These environment variables are no longer read. Update your editor configuration instead.
 
 ## Viewing LSP Messages in Zed
 
