@@ -304,14 +304,23 @@ async fn run() -> io::Result<()> {
                                     }
                                 }
                                 if let Some(init_opts) = params.get("initializationOptions") {
-                                    if let Some(solution) =
-                                        init_opts.get("solution").and_then(|v| v.as_str())
-                                    {
+                                    // Capture logging configuration
+                                    if let Some(log_level) = init_opts.get("logLevel").and_then(|v| v.as_str()) {
+                                        crate::logger::configure(Some(log_level), None, None);
+                                    }
+                                    if let Some(log_file) = init_opts.get("logFile").and_then(|v| v.as_str()) {
+                                        crate::logger::configure(None, Some(log_file), None);
+                                    } else if let Some(log_dir) = init_opts.get("logDirectory").and_then(|v| v.as_str()) {
+                                        crate::logger::configure(None, None, Some(log_dir));
+                                    }
+
+                                    if let Some(solution) = init_opts.get("solution").and_then(|v| v.as_str()) {
                                         let mut sol_uri = solution_uri_clone.blocking_lock();
                                         *sol_uri = Some(solution.to_string());
                                         logger::info("[roslyn_wrapper] Found solution URI");
                                     }
                                 }
+
                             }
                         }
                     }

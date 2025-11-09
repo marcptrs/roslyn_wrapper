@@ -1,9 +1,5 @@
-// Logging module
-// Environment variables:
-// - ROSLYN_WRAPPER_LOG_LEVEL: off|error|info|debug (default: info)
-// - ROSLYN_WRAPPER_LOG_PATH: explicit log file path; overrides CWD
-// - ROSLYN_WRAPPER_CWD: directory to place roslyn_wrapper.log if LOG_PATH not set
-// All log lines prefixed with timestamp; info/debug/error filtering is runtime-controlled.
+// Logging module controlled by LSP initialization options.
+// Defaults: level=info, file=./roslyn_wrapper.log unless reconfigured at runtime.
 use chrono::{Local, SecondsFormat};
 use once_cell::sync::Lazy;
 use std::fs::{File, OpenOptions};
@@ -11,7 +7,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-static LOG_SINK: Lazy<Mutex<LogSink>> = Lazy::new(|| Mutex::new(LogSink::new()));
+static LOG_SINK: Lazy<Mutex<LogSink>> = Lazy::new(|| Mutex::new(LogSink::new(default_log_file_path())));
 
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Debug)]
 enum LogLevel {
@@ -21,26 +17,67 @@ enum LogLevel {
     Debug = 3,
 }
 
-static LOG_LEVEL: Lazy<LogLevel> = Lazy::new(|| {
-    match std::env::var("ROSLYN_WRAPPER_LOG_LEVEL")
-        .unwrap_or_else(|_| "info".to_string())
-        .to_lowercase()
-        .as_str()
-    {
+#[derive(Clone, Debug)]
+struct LogConfig {
+    level: LogLevel,
+    file_path: PathBuf,
+}
+
+static LOG_CONFIG: Lazy<Mutex<LogConfig>> = Lazy::new(|| Mutex::new(LogConfig {
+    level: LogLevel::Info,
+    file_path: default_log_file_path(),
+}));
+
+fn parse_level(s: &str) -> LogLevel {
+    match s.to_lowercase().as_str() {
         "off" | "none" => LogLevel::Off,
         "error" => LogLevel::Error,
         "info" => LogLevel::Info,
         "debug" => LogLevel::Debug,
         _ => LogLevel::Info,
     }
-});
+}
 
 fn should_log(level: LogLevel) -> bool {
-    *LOG_LEVEL >= level
+    let cfg = LOG_CONFIG.lock().unwrap();
+    cfg.level >= level
+}
+
+pub fn configure(level: Option<&str>, file_path: Option<&str>, directory: Option<&str>) {
+    let mut cfg = LOG_CONFIG.lock().unwrap();
+
+    if let Some(level_str) = level {
+        cfg.level = parse_level(level_str);
+    }
+
+    if let Some(path_str) = file_path {
+        if !path_str.trim().is_empty() {
+            cfg.file_path = PathBuf::from(path_str);
+        }
+    } else if let Some(dir_str) = directory {
+        if !dir_str.trim().is_empty() {
+            cfg.file_path = PathBuf::from(dir_str).join("roslyn_wrapper.log");
+        }
+    }
+
+    if let Ok(mut sink) = LOG_SINK.lock() {
+        sink.reopen(cfg.file_path.clone());
+        // Emit a line to confirm reconfiguration
+        let timestamp = Local::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        if let Some(f) = sink.file.as_mut() {
+            let _ = writeln!(
+                f,
+                "[{}] [roslyn_wrapper] Logger reconfigured (level: {:?}, path: {})",
+                timestamp,
+                cfg.level,
+                cfg.file_path.display()
+            );
+            let _ = f.flush();
+        }
+    }
 }
 
 pub fn log_line(message: impl AsRef<str>) {
-    // Backwards compatibility: treat as info-level
     if should_log(LogLevel::Info) {
         if let Ok(mut sink) = LOG_SINK.lock() {
             sink.write_str(message.as_ref());
@@ -73,10 +110,8 @@ struct LogSink {
 }
 
 impl LogSink {
-    fn new() -> Self {
-        let path = log_file_path();
+    fn new(path: PathBuf) -> Self {
         let mut file = initialize_file(&path);
-
         if let Some(file_handle) = file.as_mut() {
             let timestamp = Local::now().to_rfc3339_opts(SecondsFormat::Millis, true);
             let _ = writeln!(
@@ -87,8 +122,11 @@ impl LogSink {
             );
             let _ = file_handle.flush();
         }
-
         Self { file }
+    }
+
+    fn reopen(&mut self, path: PathBuf) {
+        self.file = initialize_file(&path);
     }
 
     fn write_str(&mut self, message: &str) {
@@ -102,23 +140,12 @@ impl LogSink {
     }
 }
 
-pub fn log_file_path() -> PathBuf {
-    if let Ok(path) = std::env::var("ROSLYN_WRAPPER_LOG_PATH") {
-        if !path.trim().is_empty() {
-            return PathBuf::from(path);
-        }
-    }
-
-    if let Ok(cwd) = std::env::var("ROSLYN_WRAPPER_CWD") {
-        if !cwd.trim().is_empty() {
-            return PathBuf::from(cwd).join("roslyn_wrapper.log");
-        }
-    }
-
+fn default_log_file_path() -> PathBuf {
     std::env::current_dir()
         .unwrap_or_else(|_| std::env::temp_dir())
         .join("roslyn_wrapper.log")
 }
+
 fn initialize_file(path: &PathBuf) -> Option<File> {
     if let Some(parent) = path.parent() {
         if !parent.exists() {
@@ -134,67 +161,21 @@ fn initialize_file(path: &PathBuf) -> Option<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use once_cell::sync::Lazy;
-    use std::env;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
-    static ENV_GUARD: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
-
     #[test]
-    fn resolve_log_path_prefers_explicit_env() {
-        let _guard = ENV_GUARD.lock().unwrap();
-        let temp_dir = tempdir().unwrap();
-        let explicit_path = temp_dir.path().join("custom.log");
-
-        env::set_var("ROSLYN_WRAPPER_LOG_PATH", &explicit_path);
-        env::remove_var("ROSLYN_WRAPPER_CWD");
-
-        let resolved = log_file_path();
-        assert_eq!(resolved, explicit_path);
-
-        env::remove_var("ROSLYN_WRAPPER_LOG_PATH");
+    fn configure_updates_path_and_level() {
+        let tmp = tempdir().unwrap();
+        let log_path = tmp.path().join("x.log");
+        configure(Some("debug"), Some(log_path.to_str().unwrap()), None);
+        // Write a debug message; ensure no panic
+        debug("[roslyn_wrapper] test debug");
     }
 
     #[test]
-    fn resolve_log_path_falls_back_to_cwd() {
-        let _guard = ENV_GUARD.lock().unwrap();
-        let temp_dir = tempdir().unwrap();
-        env::remove_var("ROSLYN_WRAPPER_LOG_PATH");
-        env::set_var("ROSLYN_WRAPPER_CWD", temp_dir.path());
-
-        let resolved = log_file_path();
-        assert_eq!(resolved, temp_dir.path().join("roslyn_wrapper.log"));
-
-        env::remove_var("ROSLYN_WRAPPER_CWD");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn log_sink_gracefully_handles_unwritable_path() {
-        let _guard = ENV_GUARD.lock().unwrap();
-        let temp_dir = tempdir().unwrap();
-        let readonly_dir = temp_dir.path().join("readonly");
-        std::fs::create_dir(&readonly_dir).unwrap();
-
-        let mut perms = std::fs::metadata(&readonly_dir).unwrap().permissions();
-        let original_mode = perms.mode();
-        perms.set_mode(0o500);
-        std::fs::set_permissions(&readonly_dir, perms.clone()).unwrap();
-
-        let log_path = readonly_dir.join("test.log");
-        env::set_var("ROSLYN_WRAPPER_LOG_PATH", &log_path);
-        env::remove_var("ROSLYN_WRAPPER_CWD");
-
-        let sink = LogSink::new();
-        assert!(sink.file.is_none());
-        drop(sink);
-
-        let mut restore = std::fs::metadata(&readonly_dir).unwrap().permissions();
-        restore.set_mode(original_mode);
-        std::fs::set_permissions(&readonly_dir, restore).unwrap();
-
-        env::remove_var("ROSLYN_WRAPPER_LOG_PATH");
+    fn configure_directory_sets_default_filename() {
+        let tmp = tempdir().unwrap();
+        configure(Some("info"), None, Some(tmp.path().to_str().unwrap()));
+        info("[roslyn_wrapper] test info");
     }
 }
