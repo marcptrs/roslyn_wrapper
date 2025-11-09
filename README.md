@@ -63,7 +63,7 @@ roslyn-wrapper supports three behaviors:
 
 ### Editor Integration (Zed)
 
-Add to your Zed `settings.json`:
+Add to your Zed `settings.json` (minimal example):
 
 ```json
 {
@@ -76,18 +76,13 @@ Add to your Zed `settings.json`:
         "solution": "file:///absolute/path/to/YourSolution.sln"
       }
     }
-  },
-  "languages": {
-    "C#": {
-      "language_servers": ["roslyn"]
-    }
   }
 }
 ```
 
 Behavior:
-- If `initialization_options.solution` is provided, the wrapper sends a `solution/open` for that URI after initialization.
-- If not provided, the wrapper tries to discover a `.sln` or `.csproj` under the workspace roots (from `rootUri` and/or `workspaceFolders`) up to depth 4 and sends `solution/open` if found.
+- `binary.path` is optional if the `roslyn-wrapper` binary is on your `PATH` or launched via another mechanism.
+- `initialization_options.solution` is optional. If omitted, the wrapper tries to discover a `.sln` or `.csproj` under the workspace roots (from `rootUri` and/or `workspaceFolders`) up to depth 4 and sends `solution/open` if found.
 - If nothing is found, it warns via `window/showMessage` that C# features are limited until a solution/project is opened.
 
 ## Logs
