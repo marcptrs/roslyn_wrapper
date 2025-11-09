@@ -176,6 +176,11 @@ fn find_global_roslyn() -> Result<PathBuf> {
     // Common paths where dotnet tools are installed
     let home_dir = dirs::home_dir().ok_or_else(|| anyhow!("Cannot determine home directory"))?;
 
+    #[cfg(windows)]
+    let mut possible_paths = vec![
+        home_dir.join(".dotnet/tools/Microsoft.CodeAnalysis.LanguageServer"),
+    ];
+    #[cfg(not(windows))]
     let possible_paths = vec![
         home_dir.join(".dotnet/tools/Microsoft.CodeAnalysis.LanguageServer"),
     ];
