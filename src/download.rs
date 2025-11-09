@@ -1,15 +1,29 @@
 use anyhow::{anyhow, Result};
 use directories::ProjectDirs;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use zip::ZipArchive;
 
-// Always try to download the latest version first
-// Using Azure DevOps feed versions (latest from msft_consumption feed)
-const LATEST_ROSLYN_VERSION: &str = "5.3.0-2.25554.12";
+// Use stable version from nuget.org (public, no authentication required)
+const ROSLYN_VERSION: &str = "5.0.0-1.25277.114";
 
-// Fallback versions if latest fails
-const FALLBACK_ROSLYN_VERSIONS: &[&str] = &["5.3.0-2.25553.6", "5.0.0-1.25277.114"];
+// LSP Message Type Constants
+const LSP_MESSAGE_TYPE_INFO: i64 = 3;
+
+/// Send an LSP window/showMessage notification to stderr
+/// This allows the wrapper to communicate status to Zed before LSP initialization
+fn send_lsp_notification(message: &str) {
+    let notification = format!(
+        r#"{{"jsonrpc":"2.0","method":"window/showMessage","params":{{"type":{},"message":"{}"}}}}"#,
+        LSP_MESSAGE_TYPE_INFO,
+        message.replace('"', "\\\"")
+    );
+    
+    // Send to stderr so it doesn't interfere with LSP protocol on stdout
+    let _ = writeln!(std::io::stderr(), "{}", notification);
+    let _ = std::io::stderr().flush();
+}
 
 /// Get the cache directory for storing Roslyn
 pub fn get_cache_dir() -> Result<PathBuf> {
@@ -76,69 +90,54 @@ fn cleanup_old_versions(cache_dir: &Path, latest_version: &str) -> Result<()> {
 pub async fn get_roslyn_path() -> Result<PathBuf> {
     let cache_dir = get_cache_dir()?;
 
-    // Check if latest version is already cached
-    let latest_dir = cache_dir.join(LATEST_ROSLYN_VERSION);
-    if let Ok(binary_path) = find_binary_in_dir(&latest_dir) {
+    // Check if version is already cached
+    let version_dir = cache_dir.join(ROSLYN_VERSION);
+    if let Ok(binary_path) = find_binary_in_dir(&version_dir) {
         crate::logger::info(format!(
-            "[roslyn_wrapper] Using cached Roslyn {LATEST_ROSLYN_VERSION}"
+            "[roslyn_wrapper] Using cached Roslyn {ROSLYN_VERSION}"
         ));
+        send_lsp_notification("Roslyn LSP is ready");
         return Ok(binary_path);
     }
 
-    // Try to download the latest version
+    // Try to download the version
+    send_lsp_notification(&format!("Downloading Roslyn LSP {}...", ROSLYN_VERSION));
     crate::logger::info(format!(
-        "[roslyn_wrapper] Downloading latest Roslyn {LATEST_ROSLYN_VERSION}"
+        "[roslyn_wrapper] Downloading Roslyn {ROSLYN_VERSION} from nuget.org"
     ));
 
-    if let Ok(()) = download_and_extract_roslyn(&latest_dir, LATEST_ROSLYN_VERSION).await {
+    if let Ok(()) = download_and_extract_roslyn(&version_dir, ROSLYN_VERSION).await {
         crate::logger::debug("[roslyn_wrapper] Download and extraction succeeded");
 
-        // Clean up old versions now that we have the latest
-        let _ = cleanup_old_versions(&cache_dir, LATEST_ROSLYN_VERSION);
+        // Clean up old versions now that we have the current one
+        let _ = cleanup_old_versions(&cache_dir, ROSLYN_VERSION);
 
         // Search for the binary after extraction
-        if let Ok(binary_path) = find_binary_in_dir(&latest_dir) {
+        if let Ok(binary_path) = find_binary_in_dir(&version_dir) {
             crate::logger::info(format!(
-                "[roslyn_wrapper] Installed Roslyn {LATEST_ROSLYN_VERSION}"
+                "[roslyn_wrapper] Installed Roslyn {ROSLYN_VERSION}"
             ));
+            send_lsp_notification("Roslyn LSP installation complete");
             return Ok(binary_path);
         } else {
             crate::logger::error("[roslyn_wrapper] Binary not found after extraction");
+            send_lsp_notification("Error: Roslyn binary not found after extraction");
         }
     } else {
-        crate::logger::error("[roslyn_wrapper] Failed to download latest Roslyn, trying fallbacks");
-    }
-
-    // Try fallback versions
-    for version in FALLBACK_ROSLYN_VERSIONS {
-        let version_dir = cache_dir.join(version);
-
-        crate::logger::info(format!("[roslyn_wrapper] Downloading Roslyn {version}"));
-
-        if let Ok(()) = download_and_extract_roslyn(&version_dir, version).await {
-            crate::logger::debug("[roslyn_wrapper] Download and extraction succeeded");
-            // Search for the binary after extraction
-            if let Ok(binary_path) = find_binary_in_dir(&version_dir) {
-                crate::logger::info(format!("[roslyn_wrapper] Installed Roslyn {version}"));
-                return Ok(binary_path);
-            } else {
-                crate::logger::error("[roslyn_wrapper] Binary not found after extraction");
-            }
-        } else {
-            crate::logger::error("[roslyn_wrapper] Download or extraction failed");
-        }
-        crate::logger::info(format!(
-            "[roslyn_wrapper] Trying next version after {version}"
-        ));
+        crate::logger::error("[roslyn_wrapper] Failed to download Roslyn");
+        send_lsp_notification("Download failed, checking for global installation...");
     }
 
     // Fallback: Try to use globally installed Roslyn via dotnet tool
+    send_lsp_notification("Checking for globally installed Roslyn...");
     crate::logger::info("[roslyn_wrapper] Checking for globally installed Roslyn");
     if let Ok(global_path) = find_global_roslyn() {
         crate::logger::info("[roslyn_wrapper] Using globally installed Roslyn");
+        send_lsp_notification("Using globally installed Roslyn LSP");
         return Ok(global_path);
     }
 
+    send_lsp_notification("Error: Failed to download or find Roslyn LSP");
     Err(anyhow!(
         "Failed to find or download Roslyn LSP. Please ensure:\n\
          1. You have internet access for NuGet downloads, or\n\
@@ -221,14 +220,20 @@ async fn download_and_extract_roslyn(target_dir: &Path, version: &str) -> Result
     crate::logger::debug(format!("[roslyn_wrapper] Download URL: {nuget_url}"));
 
     let client = reqwest::Client::new();
-    let response = client.get(&nuget_url).send().await?;
+    let response = client.get(&nuget_url).send().await.map_err(|e| {
+        let error_msg = format!("Network error downloading Roslyn: {}", e);
+        send_lsp_notification(&error_msg);
+        anyhow!(error_msg)
+    })?;
 
     if !response.status().is_success() {
-        return Err(anyhow!(
+        let error_msg = format!(
             "Failed to download Roslyn {}: HTTP {}",
             version,
             response.status()
-        ));
+        );
+        send_lsp_notification(&error_msg);
+        return Err(anyhow!(error_msg));
     }
 
     let bytes = response.bytes().await?;
@@ -236,6 +241,8 @@ async fn download_and_extract_roslyn(target_dir: &Path, version: &str) -> Result
         "[roslyn_wrapper] Download size {} bytes",
         bytes.len()
     ));
+
+    send_lsp_notification("Extracting Roslyn LSP...");
 
     // Extract to temporary location first
     let temp_path = target_dir

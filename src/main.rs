@@ -120,21 +120,40 @@ async fn get_roslyn_lsp_path(args: &[String]) -> io::Result<String> {
         #[cfg(not(windows))]
         let normalized = path_arg.clone();
 
-        // Verify file exists
-        let path_to_use = match std::fs::metadata(&normalized) {
-            Ok(_) => normalized,
-            Err(_) => match std::fs::metadata(path_arg) {
-                Ok(_) => path_arg.to_string(),
-                Err(_) => {
-                    logger::error(format!(
-                        "[roslyn_wrapper] Cannot find Roslyn LSP at: {path_arg}"
-                    ));
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!("Cannot find Roslyn LSP at: {path_arg}"),
-                    ));
+        // If path is relative, resolve it relative to the wrapper binary's directory
+        let path_to_check = if PathBuf::from(&normalized).is_relative() {
+            if let Ok(exe_path) = std::env::current_exe() {
+                if let Some(exe_dir) = exe_path.parent() {
+                    exe_dir.join(&normalized)
+                } else {
+                    PathBuf::from(&normalized)
                 }
-            },
+            } else {
+                PathBuf::from(&normalized)
+            }
+        } else {
+            PathBuf::from(&normalized)
+        };
+
+        // Verify file exists
+        let path_to_use = match std::fs::metadata(&path_to_check) {
+            Ok(_) => path_to_check.to_string_lossy().to_string(),
+            Err(_) => {
+                // Fallback: try the original path as-is
+                match std::fs::metadata(&normalized) {
+                    Ok(_) => normalized.clone(),
+                    Err(_) => {
+                        logger::error(format!(
+                            "[roslyn_wrapper] Cannot find Roslyn LSP at: {path_arg} (tried {} and {})",
+                            path_to_check.display(), normalized
+                        ));
+                        return Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!("Cannot find Roslyn LSP at: {path_arg}"),
+                        ));
+                    }
+                }
+            }
         };
 
         Ok(path_to_use)
