@@ -1,366 +1,559 @@
-use anyhow::{Context, Result};
-use clap::Parser;
-use serde_json::{json, Value};
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::collections::HashMap;
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
-use std::process::Stdio;
-use std::sync::{Arc, Mutex};
-use tokio::io::{self, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
-#[derive(Parser, Debug)]
-#[command(name = "roslyn-wrapper")]
-#[command(about = "A transparent LSP wrapper for Roslyn C# language server", long_about = None)]
-struct Args {
-    /// Path to Roslyn server DLL
-    #[arg(required = true)]
-    server_path: String,
+use serde_json::{json, Value};
 
-    /// Enable debug logging to logs/proxy-debug.log
-    #[arg(long, default_value_t = false)]
-    debug: bool,
+mod download;
+mod logger;
+mod path_utils;
 
-    /// Additional arguments to pass to the server
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    server_args: Vec<String>,
-}
+// LSP Message Type Constants (for window/showMessage)
+const LSP_MESSAGE_TYPE_ERROR: i64 = 1;
+const LSP_MESSAGE_TYPE_WARNING: i64 = 2;
+const LSP_MESSAGE_TYPE_INFO: i64 = 3;
 
-struct Logger {
-    file: Option<Arc<Mutex<std::fs::File>>>,
-    enabled: bool,
-}
+// Roslyn Message Type Constants (for window/_roslyn_showToast)
+const ROSLYN_MESSAGE_TYPE_ERROR: i64 = 3;
+const ROSLYN_MESSAGE_TYPE_WARNING: i64 = 1;
+const ROSLYN_MESSAGE_TYPE_INFO: i64 = 2;
 
-impl Logger {
-    fn new(enabled: bool) -> Self {
-        let file = if enabled {
-            let log_dir = std::path::Path::new("logs");
-            std::fs::create_dir_all(&log_dir).ok();
+/// LSP Message Wrapper for Roslyn
+///
+/// This wrapper acts as a proxy between Zed and the Roslyn Language Server.
+/// Key responsibilities:
+/// 1. Start Roslyn subprocess
+/// 2. Forward LSP messages bidirectionally using async tasks
+/// 3. Inject `solution/open` notification after initialization
+/// 4. Handle edge cases and logging
+///
+/// Parse LSP message header and body from a reader
+fn read_lsp_message<R: Read + BufRead>(reader: &mut R) -> io::Result<Option<Value>> {
+    let mut content_length = 0;
+    let mut line = String::new();
 
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(log_dir.join("proxy-debug.log"))
-                .ok()
-                .map(|f| Arc::new(Mutex::new(f)))
-        } else {
-            None
-        };
-
-        Logger { file, enabled }
-    }
-
-    fn log(&self, message: &str) {
-        if !self.enabled {
-            return;
+    // Read headers until empty line
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            return Ok(None); // EOF
         }
 
-        if let Some(file) = &self.file {
-            if let Ok(mut file) = file.lock() {
-                let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
-                writeln!(file, "[{}] {}", timestamp, message).ok();
-            }
-        }
-    }
-}
-
-impl Clone for Logger {
-    fn clone(&self) -> Self {
-        Logger {
-            file: self.file.clone(),
-            enabled: self.enabled,
-        }
-    }
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    let args = Args::parse();
-    let logger = Logger::new(args.debug);
-
-    logger.log("Starting Roslyn LSP wrapper");
-    logger.log(&format!("Server DLL: {}", args.server_path));
-    logger.log(&format!("Debug logging: {}", args.debug));
-    logger.log(&format!("Additional args: {:?}", args.server_args));
-
-    let dotnet_path = find_dotnet().context("Failed to find dotnet executable")?;
-    logger.log(&format!("Using dotnet at: {}", dotnet_path));
-
-    let log_dir = std::path::Path::new("logs");
-    std::fs::create_dir_all(&log_dir).ok();
-    let log_dir_str = log_dir.to_string_lossy().to_string();
-
-    let mut command_args = vec![
-        args.server_path.clone(),
-        "--stdio".to_string(),
-        "--logLevel".to_string(),
-        "Information".to_string(),
-        "--extensionLogDirectory".to_string(),
-        log_dir_str,
-    ];
-    command_args.extend(args.server_args.iter().cloned());
-
-    logger.log(&format!(
-        "Spawning: {} {}",
-        dotnet_path,
-        command_args.join(" ")
-    ));
-
-    let mut server_process = Command::new(&dotnet_path)
-        .args(&command_args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("Failed to spawn Roslyn server process")?;
-
-    let mut server_stdin = server_process
-        .stdin
-        .take()
-        .context("Failed to open server stdin")?;
-    let server_stdout = server_process
-        .stdout
-        .take()
-        .context("Failed to open server stdout")?;
-    let server_stderr = server_process
-        .stderr
-        .take()
-        .context("Failed to open server stderr")?;
-
-    let stderr_logger = logger.clone();
-    tokio::spawn(async move {
-        let reader = BufReader::new(server_stderr);
-        let mut lines = reader.lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            stderr_logger.log(&format!("[Roslyn] {}", line));
-        }
-    });
-
-    let mut client_stdin = BufReader::new(io::stdin());
-    let mut client_stdout = io::stdout();
-
-    let stream_to_stdout = async {
-        let mut reader = BufReader::new(server_stdout);
-        io::copy(&mut reader, &mut client_stdout).await
-    };
-
-    let stdin_logger = logger.clone();
-    let stdin_to_stream = async {
-        loop {
-            let mut buffer = vec![0; 8192];
-            let bytes_read = client_stdin
-                .read(&mut buffer)
-                .await
-                .expect("Failed to read from client");
-
-            if bytes_read == 0 {
-                break;
-            }
-
-            server_stdin
-                .write_all(&buffer[..bytes_read])
-                .await
-                .expect("Failed to write to server");
-
-            let content = String::from_utf8_lossy(&buffer[..bytes_read]);
-
-            if content.contains("\"method\":\"initialize\"") {
-                stdin_logger.log("Detected initialize request");
-                if let Some(solution_notification) =
-                    extract_and_create_solution_notification(&content, &stdin_logger)
-                {
-                    stdin_logger.log("Will inject solution notification after 'initialized'");
-
-                    loop {
-                        let mut buffer = vec![0; 8192];
-                        let bytes_read = client_stdin
-                            .read(&mut buffer)
-                            .await
-                            .expect("Failed to read from client");
-
-                        if bytes_read == 0 {
-                            break;
-                        }
-
-                        server_stdin
-                            .write_all(&buffer[..bytes_read])
-                            .await
-                            .expect("Failed to write to server");
-
-                        let content = String::from_utf8_lossy(&buffer[..bytes_read]);
-
-                        if content.contains("\"method\":\"initialized\"") {
-                            stdin_logger
-                                .log("Detected initialized notification, injecting solution/open");
-                            server_stdin
-                                .write_all(solution_notification.as_bytes())
-                                .await
-                                .expect("Failed to inject solution notification");
-                            break;
-                        }
-                    }
-                }
-                break;
-            }
+        let line_trimmed = line.trim();
+        if line_trimmed.is_empty() {
+            break;
         }
 
-        io::copy(&mut client_stdin, &mut server_stdin).await
-    };
-
-    tokio::select! {
-        result = stdin_to_stream => {
-            if let Err(e) = result {
-                logger.log(&format!("stdin_to_stream error: {}", e));
-            }
-        }
-        result = stream_to_stdout => {
-            if let Err(e) = result {
-                logger.log(&format!("stream_to_stdout error: {}", e));
+        if line_trimmed.starts_with("Content-Length:") {
+            let parts: Vec<&str> = line_trimmed.split(':').collect();
+            if let Some(len_str) = parts.get(1) {
+                content_length = len_str.trim().parse().unwrap_or(0);
             }
         }
     }
 
-    logger.log("Proxy shutting down");
-    server_process.kill().await.ok();
+    if content_length == 0 {
+        return Ok(None);
+    }
+
+    // Read body
+    let mut buf = vec![0; content_length];
+    reader.read_exact(&mut buf)?;
+
+    let body = String::from_utf8_lossy(&buf);
+    match serde_json::from_str::<Value>(&body) {
+        Ok(value) => Ok(Some(value)),
+        Err(e) => {
+            logger::error(format!("[roslyn_wrapper] Failed to parse LSP message: {e}"));
+            Ok(None)
+        }
+    }
+}
+
+/// Send an LSP message to a writer
+fn send_lsp_message<W: Write>(writer: &mut W, msg: &Value) -> io::Result<()> {
+    let json_str = msg.to_string();
+    let header = format!("Content-Length: {}\r\n\r\n", json_str.len());
+
+    writer.write_all(header.as_bytes())?;
+    writer.write_all(json_str.as_bytes())?;
+    writer.flush()?;
 
     Ok(())
 }
 
-fn extract_and_create_solution_notification(init_message: &str, logger: &Logger) -> Option<String> {
-    let json_start = init_message.find('{')?;
-    let parsed: Value = serde_json::from_str(&init_message[json_start..]).ok()?;
-
-    let root_path = parsed["params"]["rootUri"]
-        .as_str()
-        .and_then(|uri| url::Url::parse(uri).ok())
-        .and_then(|url| url.to_file_path().ok())
-        .or_else(|| parsed["params"]["rootPath"].as_str().map(PathBuf::from))?;
-
-    logger.log(&format!("Workspace root: {}", root_path.display()));
-
-    if let Some(solution_path) = find_solution(&root_path) {
-        logger.log(&format!("Found solution: {}", solution_path.display()));
-        let solution_uri = url::Url::from_file_path(&solution_path).ok()?;
-
-        let notification = json!({
-            "jsonrpc": "2.0",
-            "method": "solution/open",
-            "params": {
-                "solution": solution_uri.to_string()
-            }
-        });
-
-        let notification_str = serde_json::to_string(&notification).ok()?;
-        let content_length = notification_str.len();
-        return Some(format!(
-            "Content-Length: {}\r\n\r\n{}",
-            content_length, notification_str
-        ));
-    }
-
-    if let Some(projects) = find_projects(&root_path) {
-        logger.log(&format!("Found {} projects", projects.len()));
-
-        let notification = json!({
-            "jsonrpc": "2.0",
-            "method": "project/open",
-            "params": {
-                "projects": projects
-            }
-        });
-
-        let notification_str = serde_json::to_string(&notification).ok()?;
-        let content_length = notification_str.len();
-        return Some(format!(
-            "Content-Length: {}\r\n\r\n{}",
-            content_length, notification_str
-        ));
-    }
-
-    None
+fn main() -> io::Result<()> {
+    // Use tokio runtime to run async code
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async { run().await })
 }
 
-fn find_solution(root: &PathBuf) -> Option<PathBuf> {
-    let extensions = ["sln", "slnx"];
+/// Handle pass-through mode for Roslyn arguments (--version, --help, etc.)
+async fn handle_passthrough_mode(args: &[String]) -> io::Result<()> {
+    logger::info("[roslyn_wrapper] Pass-through mode: forwarding arguments to Roslyn");
 
-    for entry in walkdir::WalkDir::new(root)
-        .max_depth(3)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        if let Some(ext) = entry.path().extension() {
-            if extensions.iter().any(|&e| e == ext) {
-                return Some(entry.path().to_path_buf());
-            }
-        }
-    }
+    // Download/find Roslyn first
+    let roslyn_path = download::get_roslyn_path()
+        .await
+        .map_err(|e| io::Error::other(e.to_string()))?;
 
-    None
+    // Execute Roslyn with the provided arguments
+    let status = Command::new(roslyn_path).args(&args[1..]).status()?;
+
+    std::process::exit(status.code().unwrap_or(1));
 }
 
-fn find_projects(root: &PathBuf) -> Option<Vec<String>> {
-    let mut projects = Vec::new();
+/// Resolve the Roslyn LSP binary path from arguments or download
+async fn get_roslyn_lsp_path(args: &[String]) -> io::Result<String> {
+    if let Some(path_arg) = args.get(1) {
+        logger::info(format!(
+            "[roslyn_wrapper] Using Roslyn LSP path from extension: {path_arg}"
+        ));
 
-    for entry in walkdir::WalkDir::new(root)
-        .max_depth(3)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        if let Some(ext) = entry.path().extension() {
-            if ext == "csproj" {
-                if let Ok(uri) = url::Url::from_file_path(entry.path()) {
-                    projects.push(uri.to_string());
+        // Normalize path
+        #[cfg(windows)]
+        let normalized = path_arg.replace('/', "\\");
+        #[cfg(not(windows))]
+        let normalized = path_arg.clone();
+
+        // Verify file exists
+        let path_to_use = match std::fs::metadata(&normalized) {
+            Ok(_) => normalized,
+            Err(_) => match std::fs::metadata(path_arg) {
+                Ok(_) => path_arg.to_string(),
+                Err(_) => {
+                    logger::error(format!(
+                        "[roslyn_wrapper] Cannot find Roslyn LSP at: {path_arg}"
+                    ));
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("Cannot find Roslyn LSP at: {path_arg}"),
+                    ));
                 }
-            }
-        }
-    }
+            },
+        };
 
-    if projects.is_empty() {
-        None
+        Ok(path_to_use)
     } else {
-        Some(projects)
+        logger::info("[roslyn_wrapper] No Roslyn LSP path provided, attempting to download...");
+        let roslyn_path = download::get_roslyn_path()
+            .await
+            .map_err(|e| io::Error::other(e.to_string()))?;
+
+        Ok(roslyn_path
+            .to_str()
+            .ok_or_else(|| io::Error::other("Invalid Roslyn path"))?
+            .to_string())
     }
 }
 
-fn find_dotnet() -> Result<String> {
-    #[cfg(windows)]
-    let which_command = "where";
-    #[cfg(not(windows))]
-    let which_command = "which";
+async fn run() -> io::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
 
-    if let Ok(output) = std::process::Command::new(which_command)
-        .arg("dotnet")
-        .output()
-    {
-        if output.status.success() {
-            if let Ok(path) = String::from_utf8(output.stdout) {
-                let path = path.lines().next().unwrap_or("").trim();
-                if !path.is_empty() {
-                    return Ok(path.to_string());
+    // Check if we should pass through arguments to Roslyn (e.g., --version, --help)
+    if args.len() > 1 {
+        let first_arg = &args[1];
+
+        // If first argument looks like a flag (starts with -), pass through to Roslyn
+        if first_arg.starts_with('-') {
+            return handle_passthrough_mode(&args).await;
+        }
+    }
+
+    // LSP proxy mode: Get Roslyn LSP path from command-line arguments or download
+    let roslyn_path_str = get_roslyn_lsp_path(&args).await?;
+
+    logger::info(format!(
+        "[roslyn_wrapper] Starting Roslyn process: {roslyn_path_str}"
+    ));
+
+    // Start Roslyn subprocess
+    let mut roslyn_process = Command::new(&roslyn_path_str)
+        .args([
+            "--extensionLogDirectory",
+            ".",
+            "--logLevel",
+            "Information",
+            "--stdio",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            logger::error(format!("[roslyn_wrapper] Failed to spawn Roslyn: {e}"));
+            e
+        })?;
+
+    let roslyn_stdin = roslyn_process
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("Failed to get Roslyn stdin"))?;
+
+    let roslyn_stdout = roslyn_process
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("Failed to get Roslyn stdout"))?;
+    let roslyn_stderr = roslyn_process
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("Failed to get Roslyn stderr"))?;
+
+    logger::info("[roslyn_wrapper] Roslyn process started successfully");
+
+    // Wrap in Arc<Mutex<>> for sharing between tasks
+    let roslyn_stdin = Arc::new(Mutex::new(roslyn_stdin));
+    let mut roslyn_stdout = BufReader::new(roslyn_stdout);
+
+    // Create stdout early so it can be cloned for stderr task
+    let stdin = io::stdin();
+    let mut stdin = BufReader::new(stdin);
+    let stdout = Arc::new(Mutex::new(io::stdout()));
+
+    // Pipe Roslyn stderr to wrapper logs for debugging
+    let mut roslyn_stderr_reader = BufReader::new(roslyn_stderr);
+    let _stderr_task = tokio::task::spawn_blocking(move || {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match roslyn_stderr_reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let msg = line.trim_end();
+                    if !msg.is_empty() {
+                        logger::debug(format!("[roslyn][stderr] {msg}"));
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Shared state for initialization
+    let initialized = Arc::new(Mutex::new(false));
+    let solution_uri: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let workspace_roots: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
+
+    // Track request IDs to methods to normalize responses when needed
+    let id_method_map: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    logger::debug("[roslyn_wrapper] Starting bidirectional message forwarding");
+
+    // Spawn task to forward messages from client to Roslyn
+    let roslyn_stdin_clone = Arc::clone(&roslyn_stdin);
+    let solution_uri_clone = Arc::clone(&solution_uri);
+    let workspace_roots_c2r = Arc::clone(&workspace_roots);
+    let id_method_map_c2r = Arc::clone(&id_method_map);
+
+    let client_to_roslyn = tokio::task::spawn_blocking(move || {
+        loop {
+            match read_lsp_message(&mut stdin) {
+                Ok(Some(msg)) => {
+                    logger::debug("[roslyn_wrapper] <== FROM CLIENT");
+
+                    // Record request method by id for response normalization
+                    if let Some(id_val) = msg.get("id") {
+                        if let Some(method) = msg.get("method").and_then(|v| v.as_str()) {
+                            // Only track a few methods we may normalize
+                            let should_track = matches!(method, "textDocument/diagnostic");
+                            if should_track {
+                                let mut map = id_method_map_c2r.blocking_lock();
+                                map.insert(id_val.to_string(), method.to_string());
+                            }
+                        }
+                    }
+
+                    // Check for initialize request to extract solution URI
+                    if let Some(method) = msg.get("method").and_then(|v| v.as_str()) {
+                        if method == "initialize" {
+                            if let Some(params) = msg.get("params") {
+                                // capture workspace rootUri if present
+                                if let Some(root_uri) =
+                                    params.get("rootUri").and_then(|v| v.as_str())
+                                {
+                                    if let Ok(path) = path_utils::url_to_path(root_uri) {
+                                        let mut roots = workspace_roots_c2r.blocking_lock();
+                                        roots.clear();
+                                        roots.push(path);
+                                        logger::info("[roslyn_wrapper] Captured workspace rootUri");
+                                    }
+                                }
+                                // capture workspaceFolders if present
+                                if let Some(folders) =
+                                    params.get("workspaceFolders").and_then(|v| v.as_array())
+                                {
+                                    let mut roots = workspace_roots_c2r.blocking_lock();
+                                    if roots.is_empty() {
+                                        for f in folders {
+                                            if let Some(uri) = f.get("uri").and_then(|u| u.as_str())
+                                            {
+                                                if let Ok(p) = path_utils::url_to_path(uri) {
+                                                    roots.push(p);
+                                                }
+                                            }
+                                        }
+                                        if !roots.is_empty() {
+                                            logger::info(
+                                                "[roslyn_wrapper] Captured workspaceFolders",
+                                            );
+                                        }
+                                    }
+                                }
+                                if let Some(init_opts) = params.get("initializationOptions") {
+                                    if let Some(solution) =
+                                        init_opts.get("solution").and_then(|v| v.as_str())
+                                    {
+                                        let mut sol_uri = solution_uri_clone.blocking_lock();
+                                        *sol_uri = Some(solution.to_string());
+                                        logger::info("[roslyn_wrapper] Found solution URI");
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Forward to Roslyn
+                    let mut roslyn_stdin = roslyn_stdin_clone.blocking_lock();
+                    if let Err(e) = send_lsp_message(&mut *roslyn_stdin, &msg) {
+                        logger::error(format!("[roslyn_wrapper] Error forwarding to Roslyn: {e}"));
+                        break;
+                    }
+                    logger::debug("[roslyn_wrapper] ==> TO ROSLYN");
+                }
+                Ok(None) => {
+                    logger::info("[roslyn_wrapper] Client closed connection");
+                    break;
+                }
+                Err(e) => {
+                    logger::error(format!("[roslyn_wrapper] Error reading from client: {e}"));
+                    break;
                 }
             }
         }
-    }
+    });
 
-    #[cfg(windows)]
-    let common_paths = vec![
-        "C:\\Program Files\\dotnet\\dotnet.exe",
-        "C:\\Program Files (x86)\\dotnet\\dotnet.exe",
-    ];
+    // Main task: forward messages from Roslyn to client
+    let id_method_map_r2c = Arc::clone(&id_method_map);
+    let workspace_roots_r2c = Arc::clone(&workspace_roots);
+    let stdout_r2c = Arc::clone(&stdout);
+    let roslyn_to_client = tokio::task::spawn_blocking(move || {
+        loop {
+            match read_lsp_message(&mut roslyn_stdout) {
+                Ok(Some(mut msg)) => {
+                    logger::debug("[roslyn_wrapper] <== FROM ROSLYN");
 
-    #[cfg(not(windows))]
-    let common_paths = vec![
-        "/usr/local/share/dotnet/dotnet",
-        "/usr/local/bin/dotnet",
-        "/usr/bin/dotnet",
-        "/opt/homebrew/bin/dotnet",
-    ];
+                    // Normalize certain server->client requests with unit params
+                    let method_opt = msg
+                        .get("method")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    if let Some(method) = method_opt {
+                        if matches!(
+                            method.as_str(),
+                            "workspace/inlayHint/refresh"
+                                | "workspace/diagnostic/refresh"
+                                | "workspace/codeLens/refresh"
+                        ) {
+                            let needs_fix = match msg.get("params") {
+                                None => true,
+                                Some(v) if !v.is_object() => true, // [] or null → {}
+                                _ => false,
+                            };
+                            if needs_fix {
+                                if let Some(obj) = msg.as_object_mut() {
+                                    obj.remove("params");
+                                    logger::debug(format!(
+                                        "[roslyn_wrapper] Removed params for unit method {method}"
+                                    ));
+                                }
+                            }
+                        }
+                    }
 
-    for path in common_paths {
-        if std::path::Path::new(path).exists() {
-            return Ok(path.to_string());
+                    // Check if this is initialization response
+                    if let Some(result) = msg.get("result") {
+                        if result.get("capabilities").is_some() {
+                            let mut init = initialized.blocking_lock();
+                            if !*init {
+                                *init = true;
+                                logger::info("[roslyn_wrapper] Initialization complete");
+
+                                // Forward response to client first
+                                let mut stdout_lock = stdout.blocking_lock();
+                                if let Err(e) = send_lsp_message(&mut *stdout_lock, &msg) {
+                                    logger::error(format!(
+                                        "[roslyn_wrapper] Error forwarding to client: {e}"
+                                    ));
+                                    break;
+                                }
+                                logger::debug("[roslyn_wrapper] ==> TO CLIENT");
+
+                                drop(stdout_lock); // Release lock
+
+                                // Then send solution/open notification
+                                let sol_uri = solution_uri.blocking_lock();
+                                let maybe_solution = if sol_uri.is_some() {
+                                    sol_uri.clone()
+                                } else {
+                                    // attempt discovery from all workspace roots (rootUri and workspaceFolders)
+                                    let roots = workspace_roots_r2c.blocking_lock();
+                                    let mut found: Option<String> = None;
+                                    for r in roots.iter() {
+                                        if let Some(uri) =
+                                            path_utils::try_find_solution_or_project(r)
+                                        {
+                                            found = Some(uri);
+                                            break;
+                                        }
+                                    }
+                                    found
+                                };
+                                if let Some(uri) = maybe_solution {
+                                    let notification = json!({
+                                        "jsonrpc": "2.0",
+                                        "method": "solution/open",
+                                        "params": {
+                                            "solution": uri
+                                        }
+                                    });
+                                    logger::info(
+                                        "[roslyn_wrapper] Sending solution/open notification",
+                                    );
+                                    let mut roslyn_stdin = roslyn_stdin.blocking_lock();
+                                    if let Err(e) =
+                                        send_lsp_message(&mut *roslyn_stdin, &notification)
+                                    {
+                                        logger::error(format!(
+                                            "[roslyn_wrapper] Error sending solution/open: {e}"
+                                        ));
+                                    }
+                                } else {
+                                    logger::info(
+                                        "[roslyn_wrapper] No solution or project found to open",
+                                    );
+                                    // Inform the client so users understand why features are limited
+                                    let info_msg = json!({
+                                        "jsonrpc": "2.0",
+                                        "method": "window/showMessage",
+                                        "params": {
+                                            "type": LSP_MESSAGE_TYPE_WARNING,
+                                            "message": "No .sln or .csproj found in the workspace. C# features are limited until a solution or project is opened. Open a folder with a .sln/.csproj or configure the 'solution' option in the C# extension."
+                                        }
+                                    });
+                                    let mut stdout_lock = stdout.blocking_lock();
+                                    if let Err(e) = send_lsp_message(&mut *stdout_lock, &info_msg) {
+                                        logger::error(format!("[roslyn_wrapper] Failed to send no-solution warning: {e}"));
+                                    }
+                                }
+
+                                continue; // Already forwarded, skip duplicate
+                            }
+                        }
+                    }
+
+                    // Normalize null results for known requests (e.g., textDocument/diagnostic)
+                    if let Some(id_val) = msg.get("id") {
+                        let id_key = id_val.to_string();
+                        let tracked_method = {
+                            let mut map = id_method_map_r2c.blocking_lock();
+                            map.remove(&id_key)
+                        };
+                        if let Some(method) = tracked_method {
+                            if method == "textDocument/diagnostic" {
+                                let need_fix = match msg.get("result") {
+                                    None => true,
+                                    Some(v) if v.is_null() => true,
+                                    _ => false,
+                                };
+                                if need_fix {
+                                    if let Some(obj) = msg.as_object_mut() {
+                                        obj.insert(
+                                            "result".to_string(),
+                                            json!({
+                                                "kind": "full",
+                                                "items": []
+                                            }),
+                                        );
+                                        logger::debug("[roslyn_wrapper] Normalized null diagnostic result to empty report");
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Map Roslyn custom toast notifications to standard LSP showMessage
+                    let forward_msg = if let Some(method_name) =
+                        msg.get("method").and_then(|v| v.as_str())
+                    {
+                        if method_name == "window/_roslyn_showToast" {
+                            if let Some(params) = msg.get("params") {
+                                let message =
+                                    params.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                                let roslyn_type = params
+                                    .get("messageType")
+                                    .and_then(|v| v.as_i64())
+                                    .unwrap_or(ROSLYN_MESSAGE_TYPE_INFO);
+                                // Map Roslyn message types to LSP: 3->1 (Error), 1->2 (Warning), 2->3 (Info)
+                                let lsp_type = match roslyn_type {
+                                    ROSLYN_MESSAGE_TYPE_ERROR => LSP_MESSAGE_TYPE_ERROR,
+                                    ROSLYN_MESSAGE_TYPE_WARNING => LSP_MESSAGE_TYPE_WARNING,
+                                    ROSLYN_MESSAGE_TYPE_INFO => LSP_MESSAGE_TYPE_INFO,
+                                    _ => LSP_MESSAGE_TYPE_INFO,
+                                };
+
+                                logger::debug("[roslyn_wrapper] Rewriting _roslyn_showToast to window/showMessage");
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "window/showMessage",
+                                    "params": {
+                                        "type": lsp_type,
+                                        "message": message
+                                    }
+                                })
+                            } else {
+                                msg
+                            }
+                        } else {
+                            msg
+                        }
+                    } else {
+                        msg
+                    };
+
+                    // Forward to client
+                    let mut stdout = stdout_r2c.blocking_lock();
+                    if let Err(e) = send_lsp_message(&mut *stdout, &forward_msg) {
+                        logger::error(format!("[roslyn_wrapper] Error forwarding to client: {e}"));
+                        break;
+                    }
+                    logger::debug("[roslyn_wrapper] ==> TO CLIENT");
+                }
+                Ok(None) => {
+                    logger::info("[roslyn_wrapper] Roslyn closed connection");
+                    break;
+                }
+                Err(e) => {
+                    logger::error(format!("[roslyn_wrapper] Error reading from Roslyn: {e}"));
+                    break;
+                }
+            }
+        }
+    });
+
+    // Wait for either task to complete (which means connection closed)
+    tokio::select! {
+        _ = client_to_roslyn => {
+            logger::debug("[roslyn_wrapper] Client to Roslyn task completed");
+        }
+        _ = roslyn_to_client => {
+            logger::debug("[roslyn_wrapper] Roslyn to Client task completed");
         }
     }
 
-    anyhow::bail!("dotnet executable not found in PATH or common locations")
+    logger::info("[roslyn_wrapper] Shutting down");
+    Ok(())
 }

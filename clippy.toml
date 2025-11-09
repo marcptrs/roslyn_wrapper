@@ -1,0 +1,3 @@
+# Allow format args to not be inlined for readability
+# They will be inlined in the actual compilation
+too-many-arguments-threshold = 8

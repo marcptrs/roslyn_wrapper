@@ -1,85 +1,283 @@
-# Roslyn Wrapper
+# roslyn-wrapper
 
-A lightweight Rust-based LSP wrapper for the Roslyn language server that enables compatibility with editors beyond VSCode.
+A transparent LSP proxy for the C# Roslyn language server that enables cross-solution/project support in editors like Zed.
 
-## Overview
+## What It Does
 
-This CLI tool acts as a transparent proxy between LSP clients (like Zed) and the Roslyn C# language server (`Microsoft.CodeAnalysis.LanguageServer`), with one critical enhancement:
+roslyn-wrapper acts as a **transparent proxy** between your editor and the Roslyn language server (`Microsoft.CodeAnalysis.LanguageServer.dll`). It:
 
-- **Automatic solution/project detection**: Intercepts the LSP `initialize` → `initialized` handshake to inject a `solution/open` or `project/open` notification, enabling Roslyn to load the workspace context.
-- **Transparent message forwarding**: All other LSP messages pass through unmodified using direct stdin/stdout forwarding.
+- ✅ Forwards all LSP messages bidirectionally without modification
+- ✅ Automatically downloads and manages the Roslyn language server
+- ✅ Maps Roslyn's custom `window/_roslyn_showToast` → standard LSP `window/showMessage`
+- ✅ Logs all LSP traffic to file for debugging
+- ✅ Enables opening multiple C# projects/solutions in the same editor instance
 
-## Building
+## Installation
+
+### Prerequisites
+
+- Rust toolchain (for building from source)
+- .NET SDK 8.0 or later (for C# development)
+
+### Building
 
 ```bash
+# Clone the repository
+git clone https://github.com/marcptrs/roslyn-wrapper
+cd roslyn-wrapper
+
+# Build release binary
 cargo build --release
+
+# Binary will be at: target/release/roslyn-wrapper
+```
+
+### Platform-Specific Scripts
+
+```bash
+# Linux/macOS
+./build.sh
+
+# Windows
+.\build.ps1
 ```
 
 ## Usage
 
+### Command Line
+
 ```bash
-roslyn-wrapper [--debug] <path-to-roslyn-dll> [additional-args...]
+roslyn-wrapper [OPTIONS]
+
+Options:
+  --solution <PATH>     Path to .sln file (opens solution mode)
+  --project <PATH>      Path to .csproj file (opens project mode)
+  --help               Show help information
 ```
 
-The wrapper is invoked by the [csharp_roslyn](https://github.com/marcptrs/csharp_roslyn) extension.
+### Editor Integration (Zed Example)
 
-### Options
+Add to your Zed `settings.json`:
 
-- `--debug`: Enable debug logging to `logs/proxy-debug.log` (disabled by default)
+```json
+{
+  "lsp": {
+    "roslyn": {
+      "binary": {
+        "path": "/path/to/roslyn-wrapper",
+        "arguments": []
+      }
+    }
+  },
+  "languages": {
+    "C#": {
+      "language_servers": ["roslyn"],
+      "format_on_save": "on"
+    }
+  }
+}
+```
 
-## How It Works
+The wrapper will automatically:
+1. Download the appropriate Roslyn language server version on first run
+2. Detect and load the solution/project from your workspace root
+3. Forward all LSP messages between Zed and Roslyn
 
-1. **Startup**: Spawns the Roslyn language server as a child process
-2. **Forwarding**: Uses `io::copy` to forward stdin → server and server → stdout transparently
-3. **Interception**: Detects the `initialize` request in the message stream
-4. **Injection**: After forwarding the `initialized` notification, injects:
-   - `solution/open` notification if a `.sln` or `.slnx` file is found
-   - `project/open` notification if `.csproj` files are found
-5. **Resume**: Returns to transparent forwarding for all subsequent messages
+## Viewing Roslyn Messages in Zed
 
-## Integration
+roslyn-wrapper is a **transparent proxy** - it doesn't generate custom notifications. All Roslyn error messages, warnings, and progress updates are communicated through standard LSP channels.
 
-This tool is downloaded automatically by the [csharp_roslyn](https://github.com/marcptrs/csharp_roslyn) extension from GitHub releases.
+### Accessing the LSP Log Viewer
 
-## Releasing
+Zed has a built-in LSP Log Viewer that displays all messages from language servers:
 
-To create a new release:
+1. **Open the viewer:**
+   - Command Palette (`Cmd+Shift+P` / `Ctrl+Shift+P`) → "Open Language Server Logs"
+   - Or: `View` menu → `Open Language Server Logs`
 
-1. Update `WRAPPER_VERSION` in `csharp_roslyn/src/nuget.rs`
-2. Build binaries for all platforms:
-   ```bash
-   # macOS ARM64
-   cargo build --release --target aarch64-apple-darwin
+2. **Filter to roslyn-wrapper:**
+   - Select "roslyn-wrapper" from the language server dropdown
 
-   # macOS x64
-   cargo build --release --target x86_64-apple-darwin
+3. **Filter by log level:**
+   - **Error** (red): Critical errors like missing .NET SDK, project load failures
+   - **Warning** (yellow): Warnings during project loading
+   - **Info** (blue): Progress updates like "Loading solution...", "Project loaded"
+   - **Log** (gray): Verbose diagnostic information
 
-   # Linux ARM64
-   cargo build --release --target aarch64-unknown-linux-gnu
+### Common Messages You'll See
 
-   # Linux x64
-   cargo build --release --target x86_64-unknown-linux-gnu
+#### Project Loading
 
-   # Windows x64
-   cargo build --release --target x86_64-pc-windows-msvc
-   ```
+```
+[LanguageServerProjectSystem] Loading /path/to/YourProject.sln...
+```
 
-3. Create a GitHub release with tag `v{version}` (e.g., `v0.1.0`)
-4. Upload the following binaries as release assets:
-   - `roslyn-wrapper-osx-arm64` (from aarch64-apple-darwin)
-   - `roslyn-wrapper-osx-x64` (from x86_64-apple-darwin)
-   - `roslyn-wrapper-linux-arm64` (from aarch64-unknown-linux-gnu)
-   - `roslyn-wrapper-linux-x64` (from x86_64-unknown-linux-gnu)
-   - `roslyn-wrapper-win-x64.exe` (from x86_64-pc-windows-msvc)
+#### SDK Errors
 
-## Configuration
+```
+Error while loading /path/to/project.csproj:
+Microsoft.CodeAnalysis.MSBuild.RemoteInvocationException:
+Error while calling hostfxr function hostfxr_resolve_sdk2.
+A compatible .NET SDK was not found.
+```
 
-Update `WRAPPER_REPO_OWNER` and `WRAPPER_REPO_NAME` in `csharp_roslyn/src/nuget.rs` to point to your GitHub repository.
+**How to fix:** Install the required .NET SDK version specified in your project's `global.json` or the latest .NET SDK.
+
+#### Completion
+
+```
+workspace/projectInitializationComplete
+```
+
+This notification signals that all projects have finished loading.
+
+## Debugging
+
+### Wrapper Logs
+
+The wrapper writes detailed logs to:
+
+```
+Linux/macOS:   ~/.local/share/roslyn-wrapper/roslyn-wrapper.log
+Windows:       %LOCALAPPDATA%\roslyn-wrapper\roslyn-wrapper.log
+```
+
+These logs include:
+- All LSP messages (requests, responses, notifications)
+- stderr output from Roslyn process
+- Wrapper startup and initialization details
+
+### Viewing Logs
+
+```bash
+# Follow the log in real-time
+tail -f ~/.local/share/roslyn-wrapper/roslyn-wrapper.log
+
+# Search for errors
+grep "Error" ~/.local/share/roslyn-wrapper/roslyn-wrapper.log
+```
+
+## Architecture
+
+### Transparent Proxy Design
+
+roslyn-wrapper follows a **transparent proxy** design principle:
+
+```
+Editor (Zed) ←→ roslyn-wrapper ←→ Roslyn Language Server
+                      ↓
+                  log file
+```
+
+**What the wrapper does:**
+- Forwards all LSP messages unchanged
+- Maps non-standard messages to LSP standard equivalents
+- Logs all traffic for debugging
+
+**What the wrapper does NOT do:**
+- ❌ Generate custom notifications
+- ❌ Parse or modify error messages
+- ❌ Intercept or suppress toasts/messages
+- ❌ Implement custom progress indicators
+
+**Why this design:**
+- Roslyn already sends comprehensive error information via LSP standard channels
+- Editors like Zed have proper UI for displaying LSP logs
+- Custom notifications interfere with Roslyn's error reporting
+- Simplicity = fewer bugs and easier maintenance
+
+### Message Flow
+
+1. **Editor → Wrapper → Roslyn:**
+   - LSP requests (textDocument/*, workspace/*, etc.)
+   - Initialization, configuration, document changes
+
+2. **Roslyn → Wrapper → Editor:**
+   - `window/logMessage`: Progress updates, errors, warnings
+   - `window/showMessage`: User-facing messages (via `_roslyn_showToast` mapping)
+   - `textDocument/publishDiagnostics`: Code errors/warnings
+   - `workspace/projectInitializationComplete`: Loading complete
+
+## Troubleshooting
+
+### "A compatible .NET SDK was not found"
+
+**Solution:** Install the .NET SDK version required by your project.
+
+1. Check your project's `global.json` for SDK version requirements
+2. Download from: https://dotnet.microsoft.com/download
+3. Verify installation: `dotnet --version`
+4. Restart the editor
+
+### No Diagnostics/IntelliSense
+
+1. **Check LSP logs** (Command Palette → "Open Language Server Logs")
+2. **Look for errors** during project loading
+3. **Check wrapper logs** at `~/.local/share/roslyn-wrapper/roslyn-wrapper.log`
+4. **Verify .NET SDK** is installed: `dotnet --version`
+5. **Restart the language server** (Command Palette → "Restart Language Server")
+
+### Project Not Loading
+
+1. **Ensure a .sln or .csproj file exists** in your workspace root
+2. **Check the LSP logs** for error messages
+3. **Verify your project builds** with `dotnet build`
+4. **Check for missing NuGet packages** - run `dotnet restore`
+
+## Development
+
+### Running Tests
+
+```bash
+cargo test
+```
+
+### Testing with Large Projects
+
+Use the included `test_progress.py` script to monitor LSP messages:
+
+```bash
+python3 test_progress.py /path/to/solution.sln
+```
+
+This will:
+- Launch roslyn-wrapper with the specified solution
+- Send LSP initialization messages
+- Monitor all messages for 60 seconds
+- Display summary of message types
+
+### Code Structure
+
+```
+src/
+├── main.rs         # Entry point, LSP proxy logic, message forwarding
+├── download.rs     # Roslyn language server download and management
+├── logger.rs       # Logging infrastructure
+└── path_utils.rs   # Path manipulation utilities
+```
+
+## Contributing
+
+Contributions are welcome! Please:
+
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes with clear commit messages
+4. Add tests if applicable
+5. Submit a pull request
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+MIT License - see [LICENSE](LICENSE) file for details.
 
-## Inspiration
+## Related Documentation
 
-This project was inspired by [SofusA/csharp-language-server](https://github.com/SofusA/csharp-language-server), which demonstrated the transparent wrapper approach for Roslyn compatibility with non-VSCode editors.
+- [PROGRESS_FINDINGS.md](PROGRESS_FINDINGS.md) - Investigation into Roslyn's progress notification behavior
+- [Roslyn Language Server](https://github.com/dotnet/roslyn/tree/main/src/Features/LanguageServer)
+- [LSP Specification](https://microsoft.github.io/language-server-protocol/)
+
+## Acknowledgments
+
+- Built for use with [Zed](https://zed.dev/) editor
+- Uses the [Roslyn](https://github.com/dotnet/roslyn) language server from the .NET team
+- Inspired by the need for cross-solution C# support in modern editors
