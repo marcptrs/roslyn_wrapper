@@ -19,7 +19,7 @@ url = "2.5"
 walkdir = "2.4"
 clap = { version = "4.5", features = ["derive"] }
 chrono = "0.4"
-reqwest = { version = "0.11", features = ["stream", "rustls-tls"] }
+reqwest = { version = "0.11", default-features = false, features = ["stream", "rustls-tls"] }
 zip = "0.6"
 directories = "5.0"
 dirs = "5.0"
