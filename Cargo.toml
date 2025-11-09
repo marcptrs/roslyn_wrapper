@@ -1,6 +1,6 @@
 [package]
 name = "roslyn-wrapper"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "MIT"
 description = "LSP proxy for C# Roslyn language server with cross-project support"
@@ -19,7 +19,7 @@ url = "2.5"
 walkdir = "2.4"
 clap = { version = "4.5", features = ["derive"] }
 chrono = "0.4"
-reqwest = { version = "0.11", features = ["stream"] }
+reqwest = { version = "0.11", features = ["stream", "rustls-tls"] }
 zip = "0.6"
 directories = "5.0"
 dirs = "5.0"
